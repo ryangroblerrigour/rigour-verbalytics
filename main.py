@@ -11,18 +11,19 @@ from typing import Optional, List
 import gspread
 from google.oauth2.service_account import Credentials
 
-# Scoring libraries
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
 
+import openai
+
 # -------------------------------
 # 1) BLOCKLIST LOADING (Google Sheet)
 # -------------------------------
 
-GOOGLE_BLOCKLIST_SHEET = os.getenv("GOOGLE_BLOCKLIST_SHEET")  # "RigourVerbalytics Blocklist"
-GOOGLE_LOGS_SHEET      = os.getenv("GOOGLE_LOGS_SHEET")      # "RigourVerbalytics Logs"
+GOOGLE_BLOCKLIST_SHEET = os.getenv("GOOGLE_BLOCKLIST_SHEET")  # e.g., "RigourVerbalytics Blocklist"
+GOOGLE_LOGS_SHEET      = os.getenv("GOOGLE_LOGS_SHEET")      # e.g., "RigourVerbalytics Logs"
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
 def load_blocklist_from_sheet() -> List[tuple]:
@@ -33,7 +34,6 @@ def load_blocklist_from_sheet() -> List[tuple]:
     """
     entries = []
     try:
-        # Write the JSON credentials to a temp file so gspread can load them
         with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".json") as tmp:
             tmp.write(GOOGLE_CREDENTIALS_JSON)
             tmp.flush()
@@ -109,7 +109,7 @@ semantic_model = SentenceTransformer('sentence-transformers/paraphrase-multiling
 ai_tokenizer   = AutoTokenizer.from_pretrained("roberta-base-openai-detector")
 ai_model       = AutoModelForSequenceClassification.from_pretrained("roberta-base-openai-detector")
 
-# A small list of common UK vs US spelling pairs—used to detect locale mismatches
+# UK <-> US spelling maps
 UK_TO_US = {
     "colour": "color",
     "favourite": "favorite",
@@ -121,7 +121,6 @@ UK_TO_US = {
     "travelling": "traveling",
     "labour": "labor"
 }
-# Create the reverse mapping (US→UK) automatically
 US_TO_UK = {us: uk for uk, us in UK_TO_US.items()}
 
 def detect_locale_mismatch(requested_lang: str, answer: str) -> bool:
@@ -142,7 +141,62 @@ def detect_locale_mismatch(requested_lang: str, answer: str) -> bool:
     return False
 
 # -------------------------------
-# 4) FASTAPI SETUP
+# 4) OPENAI SETUP FOR DYNAMIC PROBES
+# -------------------------------
+
+openai.api_key = os.getenv("OPENAI_API_KEY", "")
+
+def make_snapback_text(question: str, answer: str) -> str:
+    """
+    Short snapback phrasing: ask them to elaborate on their poor answer.
+    """
+    return (
+        f"Can you elaborate on what you mean by “{answer}” in the context of “{question}”?"
+    )
+
+def make_probe_text(question: str, answer: str) -> str:
+    """
+    Fallback probe if OpenAI key is missing or call fails.
+    """
+    snippet = answer.strip()
+    return (
+        f"You said “{snippet}” when asked “{question}.” "
+        f"Could you tell me more about why/how that is important to you?"
+    )
+
+def get_dynamic_probe(question: str, answer: str) -> str:
+    """
+    Ask GPT to draft a customer-centric follow-up question
+    based on the original question and their answer.
+    """
+    if not openai.api_key:
+        return make_probe_text(question, answer)
+
+    prompt = (
+        "You are a market-research pro. Given this survey prompt:\n"
+        f"  QUESTION: \"{question}\"\n"
+        "and this respondent’s verbatim answer:\n"
+        f"  ANSWER: \"{answer}\"\n"
+        "Write a single, concise follow-up question that probes for "
+        "more detail or emotion—something a human moderator would ask. "
+        "Do not repeat the original question; instead, build on the "
+        "respondent’s answer. Return only the follow-up sentence."
+    )
+
+    try:
+        resp = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=60
+        )
+        text = resp.choices[0].message.content.strip()
+        return text
+    except Exception:
+        return make_probe_text(question, answer)
+
+# -------------------------------
+# 5) FASTAPI SETUP
 # -------------------------------
 
 API_KEY = os.getenv("API_KEY", "not-set")
@@ -159,7 +213,7 @@ app.add_middleware(
 )
 
 # -------------------------------
-# 5) Pydantic Schemas
+# 6) Pydantic Schemas
 # -------------------------------
 
 class VerbalyticsRequest(BaseModel):
@@ -169,7 +223,7 @@ class VerbalyticsRequest(BaseModel):
     question: str
     answer: str
     language: str               # "UK" or "USA"
-    probe_required: Optional[str] = "no"
+    probe_required: Optional[str] = "no"   # "yes", "no", or "force"
     response_format: Optional[str] = "json"  # "json" or "csv"
 
 class VerbalyticsResponse(BaseModel):
@@ -178,11 +232,15 @@ class VerbalyticsResponse(BaseModel):
     question_id: str
     quality_score: int
     ai_likelihood_score: int
-    snapback_required: str
-    probe_text: str
+
+    snapback_required: str   # "yes" or "no"
+    snapback_text: Optional[str] = ""
+
+    probe_required: str      # "yes", "no", or "force"
+    probe_text: Optional[str] = ""
 
 # -------------------------------
-# 6) HELPER FUNCTIONS
+# 7) SCORING FUNCTIONS
 # -------------------------------
 
 def get_quality_score(question: str, answer: str, lang: str) -> int:
@@ -234,32 +292,8 @@ def get_ai_likelihood_score(answer: str) -> int:
     except Exception:
         return 200
 
-def should_snapback(quality_score: int, threshold_low: int = 20) -> bool:
-    """
-    Return True if quality_score ≤ 20 (poor answer), else False.
-    """
-    return quality_score <= threshold_low
-
-def generate_probe_text(question: str, answer: str, snapback: bool) -> str:
-    """
-    Build a follow-up prompt that includes a snippet of the answer.
-    - If snapback=True, re-ask the question more explicitly.
-    - Otherwise, ask for clarification using the answer text.
-    """
-    if snapback:
-        return (
-            f"I’m not sure I understand—could you tell me more about how your answer relates to "
-            f"the question: \"{question}\"?"
-        )
-
-    # Example: “You said 'yellow'—can you explain how 'yellow' relates to the packaging?”
-    snippet = answer.strip()
-    return (
-        f"You mentioned \"{snippet}\"—could you explain how that relates to: \"{question}\"?"
-    )
-
 # -------------------------------
-# 7) API ENDPOINTS
+# 8) API ENDPOINTS
 # -------------------------------
 
 @app.options("/check-verbalytics")
@@ -284,9 +318,10 @@ async def check_verbalytics(
             "quality_score":       0,
             "ai_likelihood_score": 0,
             "snapback_required":   "yes",
-            "probe_text":          "Your response contains disallowed content. Please re-answer."
+            "snapback_text":       "Your response contains disallowed content. Please re-answer.",
+            "probe_required":      "no",
+            "probe_text":          ""
         }
-        # Log to Google Sheets
         log_to_sheet([
             datetime.utcnow().isoformat(),
             payload.respid,
@@ -298,7 +333,8 @@ async def check_verbalytics(
             response_data["quality_score"],
             response_data["ai_likelihood_score"],
             response_data["snapback_required"],
-            response_data["probe_text"]
+            response_data["probe_required"],
+            response_data["snapback_text"] or response_data["probe_text"]
         ])
         return JSONResponse(content=response_data)
 
@@ -306,34 +342,47 @@ async def check_verbalytics(
     q_score  = get_quality_score(payload.question, payload.answer, payload.language)
     ai_score = get_ai_likelihood_score(payload.answer)
 
-    # 4) Snapback decision
-    snapback_flag = "yes" if should_snapback(q_score) else "no"
+    # 4) Determine snapback vs probe
+    incoming_probe = (payload.probe_required or "no").lower()
+    if incoming_probe not in ("yes", "no", "force"):
+        incoming_probe = "no"
 
-    # 5) Probe generation
-    if payload.probe_required.lower() == "yes":
-        probe = generate_probe_text(payload.question, payload.answer, snapback=False)
+    if q_score <= 20 and incoming_probe != "force":
+        # Snapback case
+        snapback_required = "yes"
+        snap_text = make_snapback_text(payload.question, payload.answer)
+
+        probe_required = "no"
+        probe_text = ""
     else:
-        if snapback_flag == "yes":
-            probe = generate_probe_text(payload.question, payload.answer, snapback=True)
-        else:
-            # Only probe if quality is “ok” (21–50)
-            if 20 < q_score <= 50:
-                probe = generate_probe_text(payload.question, payload.answer, snapback=False)
-            else:
-                probe = ""
+        # Not a snapback (either q_score > 20 or forced probe)
+        snapback_required = "no"
+        snap_text = ""
 
-    # 6) Assemble response object
+        if incoming_probe == "force":
+            probe_required = "yes"
+            probe_text = get_dynamic_probe(payload.question, payload.answer)
+        elif incoming_probe == "yes" and q_score > 20:
+            probe_required = "yes"
+            probe_text = get_dynamic_probe(payload.question, payload.answer)
+        else:
+            probe_required = "no"
+            probe_text = ""
+
+    # 5) Assemble response object
     response_data = {
-        "respid":              payload.respid,
-        "project_id":          payload.project_id,
-        "question_id":         payload.question_id,
-        "quality_score":       q_score,
-        "ai_likelihood_score": ai_score,
-        "snapback_required":   snapback_flag,
-        "probe_text":          probe
+        "respid":               payload.respid,
+        "project_id":           payload.project_id,
+        "question_id":          payload.question_id,
+        "quality_score":        q_score,
+        "ai_likelihood_score":  ai_score,
+        "snapback_required":    snapback_required,
+        "snapback_text":        snap_text,
+        "probe_required":       probe_required,
+        "probe_text":           probe_text
     }
 
-    # 7) Log to Google Sheets
+    # 6) Log to Google Sheets
     log_to_sheet([
         datetime.utcnow().isoformat(),
         payload.respid,
@@ -345,18 +394,27 @@ async def check_verbalytics(
         response_data["quality_score"],
         response_data["ai_likelihood_score"],
         response_data["snapback_required"],
-        response_data["probe_text"]
+        response_data["probe_required"],
+        response_data["snapback_text"] or response_data["probe_text"]
     ])
 
-    # 8) Return in requested format
+    # 7) Return in requested format
     if payload.response_format.lower() == "csv":
-        # CSV: quality,ai,snapback,probe
+        text_field = response_data["snapback_text"] or response_data["probe_text"]
         csv_line = ",".join([
             str(response_data["quality_score"]),
             str(response_data["ai_likelihood_score"]),
             response_data["snapback_required"],
-            response_data["probe_text"].replace(",", ";")
+            text_field.replace(",", ";")
         ])
         return PlainTextResponse(csv_line)
     else:
         return JSONResponse(content=response_data)
+
+# -------------------------------
+# 9) Local Uvicorn Runner
+# -------------------------------
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
