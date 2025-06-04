@@ -7,3 +7,4 @@ torch
 gspread
 google-auth
 python-dotenv
+openai
