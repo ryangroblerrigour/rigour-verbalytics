@@ -334,7 +334,8 @@ async def check_verbalytics(
             response_data["ai_likelihood_score"],
             response_data["snapback_required"],
             response_data["probe_required"],
-            response_data["snapback_text"] or response_data["probe_text"]
+            response_data["snapback_text"],
+            response_data["probe_text"]
         ])
         return JSONResponse(content=response_data)
 
