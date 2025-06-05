@@ -150,54 +150,91 @@ def make_snapback_text(question: str, answer: str) -> str:
 
 def make_probe_text(question: str, answer: str) -> str:
     """
-    A more useful fallback probe for when GPT fails or API key is missing.
+    A simple fallback probe if GPT fails or API key is missing.
     """
     snippet = answer.strip()
     return (
-        f"Can you tell us more about what you like about “{snippet},” or give an example of when you experienced that?"
+        f"Can you tell us more about what you mean by “{snippet}”—for instance, "
+        f"which particular aspect made that stand out?"
     )
 
 def get_dynamic_probe(question: str, answer: str) -> str:
     """
-    Ask GPT to draft a single, specific follow-up that picks out a key 
-    phrase from the respondent’s one‐line answer and asks for concrete detail.
+    Use a few‐shot prompt so GPT will:
+      1) Pick out a short key phrase from the answer,
+      2) Ask about that exact phrase with a request for example or detail,
+      3) Not repeat the full original question verbatim,
+      4) Sound conversational.
     """
     if not openai.api_key:
-        # Fallback: generic but still focused on “give an example” style
-        snippet = answer.strip()
-        return (
-            f"Can you tell us more about what you mean by “{snippet}”—for example, "
-            f"which specific aspect made that stand out?"
-        )
+        return make_probe_text(question, answer)
 
-    # A prompt designed to force the model to zero in on one piece of their answer
-    prompt = (
-        "You are a research moderator. A respondent answered:\n"
-        f"  QUESTION: \"{question}\"\n"
-        f"  ANSWER: \"{answer}\"\n"
-        "Write exactly one follow-up question that:\n"
-        "  1) Identifies a short key phrase or word from their answer,\n"
-        "  2) Asks them to explain or give an example of that particular phrase,\n"
-        "  3) Does NOT repeat the full original question verbatim,\n"
-        "  4) Is phrased conversationally (as if a moderator is speaking).\n"
-        "Return only that follow-up sentence."
-    )
+    few_shot = [
+        {
+            "role": "user",
+            "content": (
+                "QUESTION: \"What was your experience like using the app?\"\n"
+                "ANSWER: \"It was straightforward and intuitive, let me complete tasks easily.\"\n"
+                "Write a follow-up that:\n"
+                "- Identifies one key phrase from the answer (e.g., “straightforward and intuitive”),\n"
+                "- Asks for a specific example or detail about that phrase,\n"
+                "- Does not repeat the entire original question,\n"
+                "- Sounds like a moderator speaking naturally.\n"
+                "Return only the follow-up."
+            )
+        },
+        {
+            "role": "assistant",
+            "content": (
+                "Which feature felt most intuitive, and can you give an example of a time it helped you complete a task quickly?"
+            )
+        },
+        {
+            "role": "user",
+            "content": (
+                "QUESTION: \"Here is a picture of a new brand of milk. What do you like about it?\"\n"
+                "ANSWER: \"It looks clean and modern.\"\n"
+                "Write a follow-up that:\n"
+                "- Identifies one key phrase (e.g., “clean and modern”),\n"
+                "- Asks for specifics or an example,\n"
+                "- Does not simply restate the question,\n"
+                "- Is conversational.\n"
+                "Return only the follow-up."
+            )
+        },
+        {
+            "role": "assistant",
+            "content": (
+                "What about the packaging makes it feel clean and modern—can you describe a detail that stands out to you?"
+            )
+        }
+    ]
+
+    # Append the actual question/answer
+    few_shot.append({
+        "role": "user",
+        "content": (
+            f"QUESTION: \"{question}\"\n"
+            f"ANSWER: \"{answer}\"\n"
+            "Write a follow-up that:\n"
+            "- Identifies one key phrase from the answer,\n"
+            "- Asks for a specific example or deeper detail about that phrase,\n"
+            "- Does not repeat the original question verbatim,\n"
+            "- Is phrased conversationally.\n"
+            "Return only the follow-up sentence."
+        )
+    })
 
     try:
         resp = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
+            messages=few_shot,
             temperature=0.7,
             max_tokens=60
         )
         return resp.choices[0].message.content.strip()
     except Exception:
-        # If GPT fails for any reason, fall back to a simpler “example‐style” probe
-        snippet = answer.strip()
-        return (
-            f"Can you tell us more about what you mean by “{snippet}”—for example, "
-            f"which specific aspect made that stand out?"
-        )
+        return make_probe_text(question, answer)
 
 # -------------------------------
 # 5) FASTAPI SETUP
@@ -249,21 +286,21 @@ class VerbalyticsResponse(BaseModel):
 
 def get_quality_score(question: str, answer: str, lang: str) -> int:
     """
-    Compute a 1–100 quality score by blending semantic similarity (80%) 
-    with keyword overlap (20%), plus:
-      • A single-word color override (floor 80 for “favorite color?” Q’s)
-      • A –20 penalty if UK/USA spelling mismatch is detected.
+    Compute a 1–100 quality score by combining semantic similarity and some
+    keyword overlap, but giving a strong boost when the answer is long and
+    well-related (sim > 0.35). Also handles single-word “color” questions
+    and a –20 locale mismatch penalty.
     """
     try:
         clean_ans = answer.strip()
         if not clean_ans:
             return 1
 
-        # 1) Compute cosine‐similarity embedding score
+        # 1) Compute embedding similarity
         embeddings = semantic_model.encode([question, answer])
         sim = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
 
-        # 2) Single‐word “favorite color” override
+        # 2) Single-word “favorite color” override
         q_low = question.lower()
         a_low = answer.lower().strip()
         if len(answer.split()) == 1:
@@ -271,20 +308,25 @@ def get_quality_score(question: str, answer: str, lang: str) -> int:
                 "favourite color" in q_low or
                 "what color" in q_low or
                 "which color" in q_low):
+                # Any single-word response to a color‐ask → floor 80
                 return 80
 
-        # 3) Keyword overlap: count shared tokens between question and answer
-        q_tokens = set(q_low.split())
-        a_tokens = set(a_low.split())
-        overlap = q_tokens & a_tokens
-        keyword_score = min(len(overlap) / max(1, len(q_tokens)), 1.0)
+        # 3) If answer is longer than 10 words and sim > 0.35,
+        #    give a length-based boost: sim' = min(sim * 1.5, 1.0)
+        if len(answer.split()) > 10 and sim > 0.35:
+            boosted_sim = min(sim * 1.5, 1.0)
+            base_score = max(1, min(int(boosted_sim * 99) + 1, 100))
+        else:
+            # 4) Otherwise, blend 80% sim with 20% keyword overlap
+            q_tokens = set(q_low.split())
+            a_tokens = set(a_low.split())
+            overlap = q_tokens & a_tokens
+            keyword_score = min(len(overlap) / max(1, len(q_tokens)), 1.0)
 
-        # 4) Combine sim (80%) and keyword overlap (20%)
-        combined = (0.8 * sim) + (0.2 * keyword_score)
-        # Clamp between 0.0 and 1.0, then scale to [1,100]
-        base_score = int(min(max(combined, 0.0), 1.0) * 99) + 1
+            combined = (0.8 * sim) + (0.2 * keyword_score)
+            base_score = int(min(max(combined, 0.0), 1.0) * 99) + 1
 
-        # 5) Apply locale mismatch penalty (–20) if UK/USA spelling mismatch
+        # 5) Apply locale mismatch penalty (–20 points) if UK/USA mismatch
         if detect_locale_mismatch(lang, answer):
             base_score = max(1, base_score - 20)
 
@@ -293,7 +335,7 @@ def get_quality_score(question: str, answer: str, lang: str) -> int:
     except Exception as e:
         print(f"Error in get_quality_score: {e}")
         return 200
-        
+
 def get_ai_likelihood_score(answer: str) -> int:
     """
     Compute an AI-likelihood score (0–100) using a RoBERTa-based classifier.
