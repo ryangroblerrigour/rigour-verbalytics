@@ -29,8 +29,7 @@ GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 def load_blocklist_from_sheet() -> List[tuple]:
     """
     Read every row in the Google Sheet “RigourVerbalytics Blocklist”
-    and return a list of (project_id, phrase) pairs.
-    If project_id is empty, that phrase is global.
+    and return a list of (project_id, phrase) pairs. A blank project_id = global.
     """
     entries = []
     try:
@@ -53,16 +52,13 @@ def load_blocklist_from_sheet() -> List[tuple]:
         print(f"⚠️  Could not load blocklist from sheet: {e}")
     return entries
 
-# Load once at startup
-BLOCKLIST = load_blocklist_from_sheet()
-
-def is_blocked(project_id: str, answer: str) -> bool:
+def is_blocked(project_id: str, answer: str, blocklist: List[tuple]) -> bool:
     """
-    Return True if 'answer' contains any phrase from BLOCKLIST.
+    Return True if 'answer' contains any phrase from the given blocklist.
     A phrase with empty project_id applies globally.
     """
     ans_low = answer.lower()
-    for pid, phrase in BLOCKLIST:
+    for pid, phrase in blocklist:
         if phrase in ans_low and (pid == "" or pid.lower() == project_id.lower()):
             return True
     return False
@@ -109,7 +105,7 @@ semantic_model = SentenceTransformer('sentence-transformers/paraphrase-multiling
 ai_tokenizer   = AutoTokenizer.from_pretrained("roberta-base-openai-detector")
 ai_model       = AutoModelForSequenceClassification.from_pretrained("roberta-base-openai-detector")
 
-# UK <-> US spelling maps
+# UK ↔ US spelling maps
 UK_TO_US = {
     "colour": "color",
     "favourite": "favorite",
@@ -126,8 +122,6 @@ US_TO_UK = {us: uk for uk, us in UK_TO_US.items()}
 def detect_locale_mismatch(requested_lang: str, answer: str) -> bool:
     """
     Return True if the answer's spelling suggests the OTHER locale.
-    - If requested_lang == 'UK' but answer uses any US spelling, return True.
-    - If requested_lang == 'USA' but answer uses any UK spelling, return True.
     """
     ans_low = answer.lower()
     if requested_lang.upper() == "UK":
@@ -166,8 +160,7 @@ def make_probe_text(question: str, answer: str) -> str:
 
 def get_dynamic_probe(question: str, answer: str) -> str:
     """
-    Ask GPT to draft a customer-centric follow-up question
-    based on the original question and their answer.
+    Ask GPT to draft a customer-centric follow-up question based on the original question and their answer.
     """
     if not openai.api_key:
         return make_probe_text(question, answer)
@@ -245,38 +238,63 @@ class VerbalyticsResponse(BaseModel):
 
 def get_quality_score(question: str, answer: str, lang: str) -> int:
     """
-    Compute a 1–100 quality score using semantic similarity + heuristics.
-    Then apply a 20-point penalty if the answer’s spelling mismatches the requested lang.
+    Compute a 1–100 quality score using semantic similarity + heuristics,
+    but with extra boosts for very short, on-topic answers and reduced
+    narrative penalty to avoid unduly penalizing valid responses.
     """
     try:
         clean_ans = answer.strip()
         if not clean_ans:
             return 1
 
+        # 1) Encode and compute cosine similarity
         embeddings = semantic_model.encode([question, answer])
         sim = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
+
+        # 2) Short-answer (≤ 5 words) direct-match override for simple Q&A:
+        #    If question explicitly asks for a single-word (e.g. "favorite color")
+        #    and answer is 1 word, give a floor of 80.
+        q_low = question.lower()
+        a_low = answer.lower().strip()
+        if len(answer.split()) == 1:
+            if ("favorite color" in q_low or
+                "favourite color" in q_low or
+                "what color" in q_low or
+                "which color" in q_low):
+                # Any single-word answer (e.g. "Blue", "Red") to a color‐ask
+                return 80
+
+        # 3) Base score if sim > 0.75
         if sim > 0.75:
             base_score = max(1, min(int(sim * 99) + 1, 100))
         else:
-            q_words = set(question.lower().split())
-            a_words = set(answer.lower().split())
+            # 4) Keyword overlap
+            q_words = set(q_low.split())
+            a_words = set(a_low.split())
             overlap = q_words & a_words
             keyword_score = min(len(overlap) / max(1, len(q_words)), 1.0)
 
-            narrative_penalty = -0.15 if len(answer.split()) > 25 else 0.0
+            # 5) Short-answer bonus: if ≤ 5 words and similarity > 0.2
             length_bonus = 0.0
-            if len(answer.split()) <= 3 and sim > 0.4:
-                length_bonus = 0.1
+            if len(answer.split()) <= 5 and sim > 0.2:
+                length_bonus = 0.4
 
-            combined = (0.9 * sim) + (0.1 * keyword_score) + length_bonus + narrative_penalty
+            # 6) Reduced narrative penalty: –0.02 if > 25 words
+            narrative_penalty = -0.02 if len(answer.split()) > 25 else 0.0
+
+            combined = (0.8 * sim) + (0.15 * keyword_score) + length_bonus + narrative_penalty
+            # Clamp between 0.0 and 1.0, then scale to 1–100
             base_score = int(min(max(combined, 0.0), 1.0) * 99) + 1
 
-        # Apply locale penalty if mismatch detected
+        # 7) Apply locale mismatch penalty (–20 points) if British vs. American spelling mismatch
         if detect_locale_mismatch(lang, answer):
             base_score = max(1, base_score - 20)
 
         return base_score
-    except Exception:
+
+    except Exception as e:
+        print(f"Error in get_quality_score: {e}")
+        # 200 signals “score could not be computed” in our logic
         return 200
 
 def get_ai_likelihood_score(answer: str) -> int:
@@ -309,8 +327,11 @@ async def check_verbalytics(
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
-    # 2) Blocklist check
-    if is_blocked(payload.project_id, payload.answer):
+    # 2) Reload blocklist on every request
+    current_blocklist = load_blocklist_from_sheet()
+
+    # 3) Blocklist check
+    if is_blocked(payload.project_id, payload.answer, current_blocklist):
         response_data = {
             "respid":              payload.respid,
             "project_id":          payload.project_id,
@@ -339,11 +360,11 @@ async def check_verbalytics(
         ])
         return JSONResponse(content=response_data)
 
-    # 3) Compute scores
+    # 4) Compute scores
     q_score  = get_quality_score(payload.question, payload.answer, payload.language)
     ai_score = get_ai_likelihood_score(payload.answer)
 
-    # 4) Determine snapback vs probe
+    # 5) Determine snapback vs probe
     incoming_probe = (payload.probe_required or "no").lower()
     if incoming_probe not in ("yes", "no", "force"):
         incoming_probe = "no"
@@ -370,7 +391,7 @@ async def check_verbalytics(
             probe_required = "no"
             probe_text = ""
 
-    # 5) Assemble response object
+    # 6) Assemble response object
     response_data = {
         "respid":               payload.respid,
         "project_id":           payload.project_id,
@@ -383,7 +404,7 @@ async def check_verbalytics(
         "probe_text":           probe_text
     }
 
-    # 6) Log to Google Sheets
+    # 7) Log to Google Sheets
     log_to_sheet([
         datetime.utcnow().isoformat(),
         payload.respid,
@@ -396,10 +417,11 @@ async def check_verbalytics(
         response_data["ai_likelihood_score"],
         response_data["snapback_required"],
         response_data["probe_required"],
-        response_data["snapback_text"] or response_data["probe_text"]
+        response_data["snapback_text"],
+        response_data["probe_text"]
     ])
 
-    # 7) Return in requested format
+    # 8) Return in requested format
     if payload.response_format.lower() == "csv":
         text_field = response_data["snapback_text"] or response_data["probe_text"]
         csv_line = ",".join([
