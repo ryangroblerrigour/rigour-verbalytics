@@ -150,30 +150,31 @@ def make_snapback_text(question: str, answer: str) -> str:
 
 def make_probe_text(question: str, answer: str) -> str:
     """
-    Fallback probe if OpenAI key is missing or call fails.
+    A more useful fallback probe for when GPT fails or API key is missing.
     """
     snippet = answer.strip()
     return (
-        f"You said “{snippet}” when asked “{question}.” "
-        f"Could you tell me more about why/how that is important to you?"
+        f"Can you tell us more about what you like about “{snippet},” or give an example of when you experienced that?"
     )
 
 def get_dynamic_probe(question: str, answer: str) -> str:
     """
-    Ask GPT to draft a customer-centric follow-up question based on the original question and their answer.
+    Ask GPT to draft a customer-centric follow-up question based on the original question and their answer,
+    prompting specifically for examples or deeper insight.
     """
     if not openai.api_key:
         return make_probe_text(question, answer)
 
     prompt = (
-        "You are a market-research pro. Given this survey prompt:\n"
+        "You are a market-research moderator. A respondent answered:\n"
         f"  QUESTION: \"{question}\"\n"
-        "and this respondent’s verbatim answer:\n"
         f"  ANSWER: \"{answer}\"\n"
-        "Write a single, concise follow-up question that probes for "
-        "more detail or emotion—something a human moderator would ask. "
-        "Do not repeat the original question; instead, build on the "
-        "respondent’s answer. Return only the follow-up sentence."
+        "Write a single, concise follow-up question that:\n"
+        "- does NOT repeat the original question verbatim,\n"
+        "- is phrased conversationally,\n"
+        "- asks for a specific example or deeper detail (e.g. “Can you give an example of…”),\n"
+        "- and ties back to what they said.\n"
+        "Return only the follow-up sentence."
     )
 
     try:
@@ -233,14 +234,15 @@ class VerbalyticsResponse(BaseModel):
     probe_text: Optional[str] = ""
 
 # -------------------------------
-# 7) SCORING FUNCTIONS
+# 7) UPDATED SCORING FUNCTION
 # -------------------------------
 
 def get_quality_score(question: str, answer: str, lang: str) -> int:
     """
     Compute a 1–100 quality score using semantic similarity + heuristics,
-    but with extra boosts for very short, on-topic answers and reduced
-    narrative penalty to avoid unduly penalizing valid responses.
+    but with a simpler, more embed-centric formula so that long, on-topic
+    answers score appropriately high. Single-word “color” answers still
+    get a floor of 80 if the question is about favorite color.
     """
     try:
         clean_ans = answer.strip()
@@ -251,9 +253,7 @@ def get_quality_score(question: str, answer: str, lang: str) -> int:
         embeddings = semantic_model.encode([question, answer])
         sim = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
 
-        # 2) Short-answer (≤ 5 words) direct-match override for simple Q&A:
-        #    If question explicitly asks for a single-word (e.g. "favorite color")
-        #    and answer is 1 word, give a floor of 80.
+        # 2) Direct‐match override for single‐word color answers
         q_low = question.lower()
         a_low = answer.lower().strip()
         if len(answer.split()) == 1:
@@ -261,32 +261,14 @@ def get_quality_score(question: str, answer: str, lang: str) -> int:
                 "favourite color" in q_low or
                 "what color" in q_low or
                 "which color" in q_low):
-                # Any single-word answer (e.g. "Blue", "Red") to a color‐ask
+                # Single‐word (e.g. “Blue”) when question asks about color ⇒ floor 80
                 return 80
 
-        # 3) Base score if sim > 0.75
-        if sim > 0.75:
-            base_score = max(1, min(int(sim * 99) + 1, 100))
-        else:
-            # 4) Keyword overlap
-            q_words = set(q_low.split())
-            a_words = set(a_low.split())
-            overlap = q_words & a_words
-            keyword_score = min(len(overlap) / max(1, len(q_words)), 1.0)
+        # 3) Use sim directly to scale to 1–100
+        #    (so if sim≈0.82, base_score≈82; if sim≈0.3, base_score≈30)
+        base_score = max(1, min(int(sim * 99) + 1, 100))
 
-            # 5) Short-answer bonus: if ≤ 5 words and similarity > 0.2
-            length_bonus = 0.0
-            if len(answer.split()) <= 5 and sim > 0.2:
-                length_bonus = 0.4
-
-            # 6) Reduced narrative penalty: –0.02 if > 25 words
-            narrative_penalty = -0.02 if len(answer.split()) > 25 else 0.0
-
-            combined = (0.8 * sim) + (0.15 * keyword_score) + length_bonus + narrative_penalty
-            # Clamp between 0.0 and 1.0, then scale to 1–100
-            base_score = int(min(max(combined, 0.0), 1.0) * 99) + 1
-
-        # 7) Apply locale mismatch penalty (–20 points) if British vs. American spelling mismatch
+        # 4) Apply locale mismatch penalty (–20 points) if British vs. American spelling mismatch
         if detect_locale_mismatch(lang, answer):
             base_score = max(1, base_score - 20)
 
