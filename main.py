@@ -159,22 +159,28 @@ def make_probe_text(question: str, answer: str) -> str:
 
 def get_dynamic_probe(question: str, answer: str) -> str:
     """
-    Ask GPT to draft a customer-centric follow-up question based on the original question and their answer,
-    prompting specifically for examples or deeper insight.
+    Ask GPT to draft a single, specific follow-up that picks out a key 
+    phrase from the respondent’s one‐line answer and asks for concrete detail.
     """
     if not openai.api_key:
-        return make_probe_text(question, answer)
+        # Fallback: generic but still focused on “give an example” style
+        snippet = answer.strip()
+        return (
+            f"Can you tell us more about what you mean by “{snippet}”—for example, "
+            f"which specific aspect made that stand out?"
+        )
 
+    # A prompt designed to force the model to zero in on one piece of their answer
     prompt = (
-        "You are a market-research moderator. A respondent answered:\n"
+        "You are a research moderator. A respondent answered:\n"
         f"  QUESTION: \"{question}\"\n"
         f"  ANSWER: \"{answer}\"\n"
-        "Write a single, concise follow-up question that:\n"
-        "- does NOT repeat the original question verbatim,\n"
-        "- is phrased conversationally,\n"
-        "- asks for a specific example or deeper detail (e.g. “Can you give an example of…”),\n"
-        "- and ties back to what they said.\n"
-        "Return only the follow-up sentence."
+        "Write exactly one follow-up question that:\n"
+        "  1) Identifies a short key phrase or word from their answer,\n"
+        "  2) Asks them to explain or give an example of that particular phrase,\n"
+        "  3) Does NOT repeat the full original question verbatim,\n"
+        "  4) Is phrased conversationally (as if a moderator is speaking).\n"
+        "Return only that follow-up sentence."
     )
 
     try:
@@ -184,10 +190,14 @@ def get_dynamic_probe(question: str, answer: str) -> str:
             temperature=0.7,
             max_tokens=60
         )
-        text = resp.choices[0].message.content.strip()
-        return text
+        return resp.choices[0].message.content.strip()
     except Exception:
-        return make_probe_text(question, answer)
+        # If GPT fails for any reason, fall back to a simpler “example‐style” probe
+        snippet = answer.strip()
+        return (
+            f"Can you tell us more about what you mean by “{snippet}”—for example, "
+            f"which specific aspect made that stand out?"
+        )
 
 # -------------------------------
 # 5) FASTAPI SETUP
