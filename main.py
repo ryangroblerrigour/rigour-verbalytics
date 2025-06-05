@@ -239,21 +239,21 @@ class VerbalyticsResponse(BaseModel):
 
 def get_quality_score(question: str, answer: str, lang: str) -> int:
     """
-    Compute a 1–100 quality score using semantic similarity + heuristics,
-    but with a simpler, more embed-centric formula so that long, on-topic
-    answers score appropriately high. Single-word “color” answers still
-    get a floor of 80 if the question is about favorite color.
+    Compute a 1–100 quality score by blending semantic similarity (80%) 
+    with keyword overlap (20%), plus:
+      • A single-word color override (floor 80 for “favorite color?” Q’s)
+      • A –20 penalty if UK/USA spelling mismatch is detected.
     """
     try:
         clean_ans = answer.strip()
         if not clean_ans:
             return 1
 
-        # 1) Encode and compute cosine similarity
+        # 1) Compute cosine‐similarity embedding score
         embeddings = semantic_model.encode([question, answer])
         sim = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
 
-        # 2) Direct‐match override for single‐word color answers
+        # 2) Single‐word “favorite color” override
         q_low = question.lower()
         a_low = answer.lower().strip()
         if len(answer.split()) == 1:
@@ -261,14 +261,20 @@ def get_quality_score(question: str, answer: str, lang: str) -> int:
                 "favourite color" in q_low or
                 "what color" in q_low or
                 "which color" in q_low):
-                # Single‐word (e.g. “Blue”) when question asks about color ⇒ floor 80
                 return 80
 
-        # 3) Use sim directly to scale to 1–100
-        #    (so if sim≈0.82, base_score≈82; if sim≈0.3, base_score≈30)
-        base_score = max(1, min(int(sim * 99) + 1, 100))
+        # 3) Keyword overlap: count shared tokens between question and answer
+        q_tokens = set(q_low.split())
+        a_tokens = set(a_low.split())
+        overlap = q_tokens & a_tokens
+        keyword_score = min(len(overlap) / max(1, len(q_tokens)), 1.0)
 
-        # 4) Apply locale mismatch penalty (–20 points) if British vs. American spelling mismatch
+        # 4) Combine sim (80%) and keyword overlap (20%)
+        combined = (0.8 * sim) + (0.2 * keyword_score)
+        # Clamp between 0.0 and 1.0, then scale to [1,100]
+        base_score = int(min(max(combined, 0.0), 1.0) * 99) + 1
+
+        # 5) Apply locale mismatch penalty (–20) if UK/USA spelling mismatch
         if detect_locale_mismatch(lang, answer):
             base_score = max(1, base_score - 20)
 
@@ -276,9 +282,8 @@ def get_quality_score(question: str, answer: str, lang: str) -> int:
 
     except Exception as e:
         print(f"Error in get_quality_score: {e}")
-        # 200 signals “score could not be computed” in our logic
         return 200
-
+        
 def get_ai_likelihood_score(answer: str) -> int:
     """
     Compute an AI-likelihood score (0–100) using a RoBERTa-based classifier.
