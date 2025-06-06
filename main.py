@@ -19,11 +19,17 @@ import torch
 import openai
 
 # -------------------------------
-# 1) BLOCKLIST LOADING (Google Sheet)
+# 1) DEBUG: Print OpenAI key length at startup
+# -------------------------------
+openai.api_key = os.getenv("OPENAI_API_KEY", "")
+print(f"🔍 DEBUG: openai.api_key length is {len(openai.api_key)}")
+
+# -------------------------------
+# 2) BLOCKLIST LOADING (Google Sheet)
 # -------------------------------
 
-GOOGLE_BLOCKLIST_SHEET = os.getenv("GOOGLE_BLOCKLIST_SHEET")  # e.g., "RigourVerbalytics Blocklist"
-GOOGLE_LOGS_SHEET      = os.getenv("GOOGLE_LOGS_SHEET")      # e.g., "RigourVerbalytics Logs"
+GOOGLE_BLOCKLIST_SHEET  = os.getenv("GOOGLE_BLOCKLIST_SHEET")  # e.g., "RigourVerbalytics Blocklist"
+GOOGLE_LOGS_SHEET       = os.getenv("GOOGLE_LOGS_SHEET")      # e.g., "RigourVerbalytics Logs"
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
 def load_blocklist_from_sheet() -> List[tuple]:
@@ -64,7 +70,7 @@ def is_blocked(project_id: str, answer: str, blocklist: List[tuple]) -> bool:
     return False
 
 # -------------------------------
-# 2) LOGGING TO GOOGLE SHEETS
+# 3) LOGGING TO GOOGLE SHEETS
 # -------------------------------
 
 def get_sheets_client():
@@ -98,7 +104,7 @@ def log_to_sheet(row_values: List):
             print(f"⚠️  Failed to append log row: {e}")
 
 # -------------------------------
-# 3) SCORING MODELS SETUP
+# 4) SCORING MODELS SETUP
 # -------------------------------
 
 semantic_model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
@@ -135,11 +141,8 @@ def detect_locale_mismatch(requested_lang: str, answer: str) -> bool:
     return False
 
 # -------------------------------
-# 4) OPENAI SETUP FOR DYNAMIC PROBES
+# 5) OPENAI SETUP FOR DYNAMIC PROBES
 # -------------------------------
-
-openai.api_key = os.getenv("OPENAI_API_KEY", "")
-print(f"🔍 DEBUG: openai.api_key length is {len(openai.api_key)}")
 
 def make_snapback_text(question: str, answer: str) -> str:
     """
@@ -166,9 +169,16 @@ def get_dynamic_probe(question: str, answer: str) -> str:
       2) Ask about that exact phrase with a request for example or detail,
       3) Not repeat the full original question verbatim,
       4) Sound conversational.
+    Debug prints show whether we hit GPT or fallback.
     """
+    # 1) Check for missing API key
     if not openai.api_key:
+        print("🔴 get_dynamic_probe: No OPENAI_API_KEY set → using fallback")
+        snippet = answer.strip()
         return make_probe_text(question, answer)
+
+    # 2) We have a key—log that we're about to call
+    print("🟢 get_dynamic_probe: Calling OpenAI ChatCompletion")
 
     few_shot = [
         {
@@ -211,7 +221,7 @@ def get_dynamic_probe(question: str, answer: str) -> str:
         }
     ]
 
-    # Append the actual question/answer
+    # Append our actual question/answer
     few_shot.append({
         "role": "user",
         "content": (
@@ -233,12 +243,16 @@ def get_dynamic_probe(question: str, answer: str) -> str:
             temperature=0.7,
             max_tokens=60
         )
-        return resp.choices[0].message.content.strip()
-    except Exception:
+        probe_text = resp.choices[0].message.content.strip()
+        print("🟢 get_dynamic_probe: Received probe →", probe_text)
+        return probe_text
+
+    except Exception as e:
+        print("🔴 get_dynamic_probe: ChatCompletion exception:", str(e))
         return make_probe_text(question, answer)
 
 # -------------------------------
-# 5) FASTAPI SETUP
+# 6) FASTAPI SETUP
 # -------------------------------
 
 API_KEY = os.getenv("API_KEY", "not-set")
@@ -265,9 +279,8 @@ async def debug_openai():
         "key_length": len(key)
     }
 
-
 # -------------------------------
-# 6) Pydantic Schemas
+# 7) Pydantic Schemas
 # -------------------------------
 
 class VerbalyticsRequest(BaseModel):
@@ -294,22 +307,24 @@ class VerbalyticsResponse(BaseModel):
     probe_text: Optional[str] = ""
 
 # -------------------------------
-# 7) UPDATED SCORING FUNCTION
+# 8) UPDATED SCORING FUNCTION
 # -------------------------------
 
 def get_quality_score(question: str, answer: str, lang: str) -> int:
     """
-    Compute a 1–100 quality score by combining semantic similarity and some
-    keyword overlap, but giving a strong boost when the answer is long and
-    well-related (sim > 0.35). Also handles single-word “color” questions
-    and a –20 locale mismatch penalty.
+    Revised scoring:
+      • Single-word color override (80)
+      • If 3–6 words & sim > 0.10 → +0.3 length bonus
+      • If > 5 words & sim > 0.15 → length‐boost (×1.5)
+      • Otherwise blend 70% sim + 20% keyword + length_bonus
+      • –20 for UK/US mismatch
     """
     try:
         clean_ans = answer.strip()
         if not clean_ans:
             return 1
 
-        # 1) Compute embedding similarity
+        # 1) Embedding similarity
         embeddings = semantic_model.encode([question, answer])
         sim = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
 
@@ -321,25 +336,41 @@ def get_quality_score(question: str, answer: str, lang: str) -> int:
                 "favourite color" in q_low or
                 "what color" in q_low or
                 "which color" in q_low):
-                # Any single-word response to a color‐ask → floor 80
                 return 80
 
-        # 3) If answer is longer than 10 words and sim > 0.35,
-        #    give a length-based boost: sim' = min(sim * 1.5, 1.0)
-        if len(answer.split()) > 10 and sim > 0.35:
+        # 3) Compute base keyword overlap (strip punctuation)
+        q_tokens = set(q_low.replace("?", "").replace(".", "").split())
+        a_tokens = set(a_low.replace(".", "").split())
+        overlap = q_tokens & a_tokens
+        keyword_score = min(len(overlap) / max(1, len(q_tokens)), 1.0)
+
+        # 4) If “app” in answer & “bank” in question, boost keyword_score to ≥ 0.2
+        if "app" in a_tokens and "bank" in q_tokens:
+            keyword_score = max(keyword_score, 0.2)
+
+        # 5) Determine length-based bonuses
+        length_bonus = 0.0
+        num_words = len(answer.split())
+
+        # Short-answer bonus for 3–6 words (if sim > 0.10)
+        if 3 <= num_words <= 6 and sim > 0.10:
+            length_bonus = 0.3
+
+        # Larger boost for > 5 words & sim > 0.15
+        boosted_sim = None
+        if num_words > 5 and sim > 0.15:
             boosted_sim = min(sim * 1.5, 1.0)
+        else:
+            boosted_sim = None
+
+        # 6) Compute final base_score
+        if boosted_sim is not None:
             base_score = max(1, min(int(boosted_sim * 99) + 1, 100))
         else:
-            # 4) Otherwise, blend 80% sim with 20% keyword overlap
-            q_tokens = set(q_low.split())
-            a_tokens = set(a_low.split())
-            overlap = q_tokens & a_tokens
-            keyword_score = min(len(overlap) / max(1, len(q_tokens)), 1.0)
-
-            combined = (0.8 * sim) + (0.2 * keyword_score)
+            combined = (0.7 * sim) + (0.2 * keyword_score) + length_bonus
             base_score = int(min(max(combined, 0.0), 1.0) * 99) + 1
 
-        # 5) Apply locale mismatch penalty (–20 points) if UK/USA mismatch
+        # 7) Locale mismatch penalty
         if detect_locale_mismatch(lang, answer):
             base_score = max(1, base_score - 20)
 
@@ -359,11 +390,12 @@ def get_ai_likelihood_score(answer: str) -> int:
             logits = ai_model(**inputs).logits
         probs = torch.softmax(logits, dim=1).tolist()[0]
         return max(0, min(int(probs[1] * 100), 100))
-    except Exception:
+    except Exception as e:
+        print(f"Error in get_ai_likelihood_score: {e}")
         return 200
 
 # -------------------------------
-# 8) API ENDPOINTS
+# 9) API ENDPOINTS
 # -------------------------------
 
 @app.options("/check-verbalytics")
@@ -416,30 +448,33 @@ async def check_verbalytics(
     q_score  = get_quality_score(payload.question, payload.answer, payload.language)
     ai_score = get_ai_likelihood_score(payload.answer)
 
-    # 5) Determine snapback vs probe
+    # DEBUG: Log q_score and incoming_probe
     incoming_probe = (payload.probe_required or "no").lower()
-    if incoming_probe not in ("yes", "no", "force"):
-        incoming_probe = "no"
+    print(f"🔍 DEBUG check_verbalytics: q_score={q_score}, incoming_probe='{incoming_probe}'")
 
+    # 5) Determine snapback vs probe
     if q_score <= 20 and incoming_probe != "force":
-        # Snapback case
+        print("🔍 DEBUG check_verbalytics: Taking SNAPBACK path")
         snapback_required = "yes"
         snap_text = make_snapback_text(payload.question, payload.answer)
 
         probe_required = "no"
         probe_text = ""
     else:
-        # Not a snapback (either q_score > 20 or forced probe)
+        print("🔍 DEBUG check_verbalytics: Taking PROBE path (or force)")
         snapback_required = "no"
         snap_text = ""
 
         if incoming_probe == "force":
+            print("🔍 DEBUG check_verbalytics: INCOMING_PROBE == 'force' → calling get_dynamic_probe")
             probe_required = "yes"
             probe_text = get_dynamic_probe(payload.question, payload.answer)
         elif incoming_probe == "yes" and q_score > 20:
+            print("🔍 DEBUG check_verbalytics: incoming_probe == 'yes' && q_score>20 → calling get_dynamic_probe")
             probe_required = "yes"
             probe_text = get_dynamic_probe(payload.question, payload.answer)
         else:
+            print("🔍 DEBUG check_verbalytics: No probe or force → no probe_text")
             probe_required = "no"
             probe_text = ""
 
@@ -487,7 +522,7 @@ async def check_verbalytics(
         return JSONResponse(content=response_data)
 
 # -------------------------------
-# 9) Local Uvicorn Runner
+# 10) Local Uvicorn Runner
 # -------------------------------
 
 if __name__ == "__main__":
