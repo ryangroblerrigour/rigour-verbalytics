@@ -254,6 +254,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/debug-openai")
+async def debug_openai():
+    """
+    Returns whether OPENAI_API_KEY is set and its length, without revealing the key itself.
+    """
+    key = openai.api_key or ""
+    return {
+        "openai_key_present": bool(key),
+        "key_length": len(key)
+    }
+
+
 # -------------------------------
 # 6) Pydantic Schemas
 # -------------------------------
