@@ -174,7 +174,6 @@ def get_dynamic_probe(question: str, answer: str) -> str:
     # 1) Check for missing API key
     if not openai.api_key:
         print("🔴 get_dynamic_probe: No OPENAI_API_KEY set → using fallback")
-        snippet = answer.strip()
         return make_probe_text(question, answer)
 
     # 2) We have a key—log that we're about to call
@@ -237,7 +236,7 @@ def get_dynamic_probe(question: str, answer: str) -> str:
     })
 
     try:
-        resp = openai.ChatCompletion.create(
+        resp = openai.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=few_shot,
             temperature=0.7,
