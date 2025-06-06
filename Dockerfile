@@ -1,39 +1,25 @@
-# Stage 1: install dependencies
-FROM python:3.10-slim AS builder
-
-WORKDIR /app
-
-# Install build tools
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends build-essential && \
-    rm -rf /var/lib/apt/lists/*
-
-# Copy requirements and install into a local folder
-COPY requirements.txt .
-RUN pip install --upgrade pip && \
-    pip install --prefix=/install -r requirements.txt
-
-# Stage 2: runtime image
+# 1) Use a lightweight Python base image
 FROM python:3.10-slim
 
+# 2) Install system packages needed to build sentence-transformers, gspread, etc.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gcc git && \
+    rm -rf /var/lib/apt/lists/*
+
+# 3) Set /app as the working directory inside the container
 WORKDIR /app
 
-# Copy installed packages from builder
-COPY --from=builder /install /usr/local
+# 4) Copy only requirements.txt first so Docker can cache this layer
+COPY requirements.txt .
 
-# Copy application code
-COPY main.py .
-COPY routing_rules.json .
+# 5) Install all Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Expose the port Render expects
-ENV PORT 8080
-EXPOSE 8080
+# 6) Copy the rest of your application code into /app
+COPY . .
 
-# Environment variables (placeholder values; override these in Render)
-ENV API_KEY="rigour-verbalytics-service"
-ENV GOOGLE_BLOCKLIST_SHEET="RigourVerbalytics Blocklist"
-ENV GOOGLE_LOGS_SHEET="RigourVerbalytics Logs"
-ENV GOOGLE_CREDENTIALS_JSON="{}"
+# 7) Expose port 8000 (where Uvicorn will serve FastAPI)
+EXPOSE 8000
 
-# Start the FastAPI app with Uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+# 8) On container start, run Uvicorn to serve main:app
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
