@@ -139,6 +139,7 @@ def detect_locale_mismatch(requested_lang: str, answer: str) -> bool:
 # -------------------------------
 
 openai.api_key = os.getenv("OPENAI_API_KEY", "")
+print(f"🔍 DEBUG: openai.api_key length is {len(openai.api_key)}")
 
 def make_snapback_text(question: str, answer: str) -> str:
     """
