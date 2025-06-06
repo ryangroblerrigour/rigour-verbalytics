@@ -7,4 +7,4 @@ torch==2.1.0
 gspread==5.11.0
 google-auth==2.22.0
 python-dotenv==1.0.0
-openai==0.30.1
+openai
