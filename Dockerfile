@@ -15,11 +15,26 @@ COPY requirements.txt .
 # 5) Install all Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 6) Copy the rest of your application code into /app
+# 6) PRE-CACHE the Hugging Face models (SentenceTransformer and Roberta detector)
+#    This ensures the final container never tries to download at runtime.
+RUN python - <<EOF
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+# 6a) Cache the paraphrase-multilingual-MiniLM model
+SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+
+# 6b) Cache the Roberta‐based AI detector
+AutoTokenizer.from_pretrained('roberta-base-openai-detector')
+AutoModelForSequenceClassification.from_pretrained('roberta-base-openai-detector')
+print("✅ Model cache complete")
+EOF
+
+# 7) Copy the rest of your application code into /app
 COPY . .
 
-# 7) Expose port 8000 (where Uvicorn will serve FastAPI)
+# 8) Expose port 8000 (where Uvicorn will serve FastAPI)
 EXPOSE 8000
 
-# 8) On container start, run Uvicorn to serve main:app
+# 9) On container start, run Uvicorn to serve main:app
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
