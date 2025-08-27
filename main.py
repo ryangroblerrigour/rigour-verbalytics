@@ -179,7 +179,8 @@ SYSTEM_SNAPBACK = (
 )
 
 SYSTEM_FOLLOWUP = (
-    "You are a professional market research moderator. Generate ONE open-ended, concise follow-up question (max 22 words) that probes for clarification, specifics (which, why, how), or examples. Neutral tone, non-leading, no double-barrel questions, no assumptions, no emojis."
+    "You are a professional market research moderator. Generate ONE open-ended, concise follow-up question (max 22 words) that probes for clarification, specifics (which, why, how), or examples. Neutral tone, non-leading, no double-barrel questions, no assumptions, no emojis. The question MUST be a single sentence, end with a question mark, and contain at least 6 words. Do not return blank output or a lone '?' character."
+) that probes for clarification, specifics (which, why, how), or examples. Neutral tone, non-leading, no double-barrel questions, no assumptions, no emojis."
 )
 
 # ---------------------------------------------------------------------
@@ -194,6 +195,7 @@ async def _call_openai_chat(messages: list[dict], model: str, max_tokens: int) -
         resp = client.chat.completions.create(
             model=model,
             messages=messages,
+            temperature=0.2,
             max_completion_tokens=max_tokens,  # <-- updated here
         )
         return resp.choices[0].message.content.strip()
@@ -223,6 +225,20 @@ async def generate_snapback(question: str, response: str, model: str = DEFAULT_M
     return text.split("\n")[0][:120]
 
 
+def _fallback_followup(question: str, response: str) -> str:
+    r = (response or "").lower().strip()
+    q = (question or "").strip()
+    # Simple heuristics for sensible probes
+    if any(k in r for k in ["funny", "humor", "humour", "memorable", "like", "love", "enjoy"]):
+        return "What specifically made it stand out for you?"
+    if any(k in r for k in ["confusing", "unclear", "didn't get", "dont get", "don\'t get", "did not get"]):
+        return "Which part felt confusing, and why?"
+    if any(k in r for k in ["boring", "slow", "long"]):
+        return "What made it feel boring, and how could it be improved?"
+    if len(r.split()) <= 3:
+        return "Could you share a bit more detail about that?"
+    return "Can you give a specific example of what you mean?"
+
 async def generate_followup(question: str, response: str, model: str = DEFAULT_MODEL_FOLLOWUP) -> str:
     messages = [
         {"role": "system", "content": SYSTEM_FOLLOWUP},
@@ -231,17 +247,24 @@ async def generate_followup(question: str, response: str, model: str = DEFAULT_M
             "content": (
                 "Original question: "
                 + question.strip()
-                + "\nRespondent's answer: "
+                + "
+Respondent's answer: "
                 + response.strip()
-                + "\nWrite ONE follow-up question only."
+                + "
+Write ONE follow-up question only."
             ),
         },
     ]
     text = await _call_openai_chat(messages, model=model, max_tokens=min(96, MAX_TOKENS))
-    # Ensure it's a single question
-    t = text.strip()
+    t = (text or "").strip()
+    # Normalize
+    t = t.replace("
+", " ").strip()
+    # Guardrails: must be a question, length >= 6 words, no lone punctuation
+    if not t or t == "?" or len(t.split()) < 6:
+        t = _fallback_followup(question, response)
     if not t.endswith("?"):
-        t = t.rstrip(" .") + "?"
+        t = t.rstrip(" .!") + "?"
     return t
 
 
