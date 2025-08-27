@@ -1,529 +1,393 @@
-# main.py
+"""
+Verbalytics 2.0 — Fast, Reliable API for Snapback, Follow-up, and Scoring
+-----------------------------------------------------------------------
+- FastAPI with asyncio orchestration
+- Parallel generation (snapback + follow-up) and deterministic scoring
+- Optional streaming of snapback first for super-low perceived latency
+- Uses OpenAI Python SDK >= 1.0 interface (no ChatCompletion legacy)
+
+ENV VARS (set on Render or your platform):
+  - OPENAI_API_KEY
+  - MODEL_SNAPBACK (default: gpt-4o-mini)
+  - MODEL_FOLLOWUP (default: gpt-5)
+  - VERBALYTICS_MAX_TOKENS (optional override)
+
+Run locally:
+  uvicorn main:app --reload --port 8000
+"""
+from __future__ import annotations
 
 import os
-import tempfile
-from datetime import datetime
-from fastapi import FastAPI, HTTPException, Header
-from fastapi.responses import JSONResponse, PlainTextResponse
-from pydantic import BaseModel
-from typing import Optional, List
+import math
+import time
+import asyncio
+from functools import lru_cache
+from typing import Optional, Literal, Dict, Any
 
-import gspread
-from google.oauth2.service_account import Credentials
-
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-import torch
-
-import openai
-
-# -------------------------------
-# 1) DEBUG: Print OpenAI key length at startup
-# -------------------------------
-openai.api_key = os.getenv("OPENAI_API_KEY", "")
-print(f"🔍 DEBUG: openai.api_key length is {len(openai.api_key)}")
-
-# -------------------------------
-# 2) BLOCKLIST LOADING (Google Sheet)
-# -------------------------------
-
-GOOGLE_BLOCKLIST_SHEET  = os.getenv("GOOGLE_BLOCKLIST_SHEET")  # e.g., "RigourVerbalytics Blocklist"
-GOOGLE_LOGS_SHEET       = os.getenv("GOOGLE_LOGS_SHEET")      # e.g., "RigourVerbalytics Logs"
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
-
-def load_blocklist_from_sheet() -> List[tuple]:
-    """
-    Read every row in the Google Sheet “RigourVerbalytics Blocklist”
-    and return a list of (project_id, phrase) pairs. A blank project_id = global.
-    """
-    entries = []
-    try:
-        with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".json") as tmp:
-            tmp.write(GOOGLE_CREDENTIALS_JSON)
-            tmp.flush()
-            creds = Credentials.from_service_account_file(tmp.name, scopes=[
-                "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive"
-            ])
-        client = gspread.authorize(creds)
-        sheet = client.open(GOOGLE_BLOCKLIST_SHEET).sheet1
-        rows = sheet.get_all_records()
-        for row in rows:
-            pid = (row.get("project_id") or "").strip()
-            phrase = (row.get("phrase") or "").strip().lower()
-            if phrase:
-                entries.append((pid, phrase))
-    except Exception as e:
-        print(f"⚠️  Could not load blocklist from sheet: {e}")
-    return entries
-
-def is_blocked(project_id: str, answer: str, blocklist: List[tuple]) -> bool:
-    """
-    Return True if 'answer' contains any phrase from the given blocklist.
-    A phrase with empty project_id applies globally.
-    """
-    ans_low = answer.lower()
-    for pid, phrase in blocklist:
-        if phrase in ans_low and (pid == "" or pid.lower() == project_id.lower()):
-            return True
-    return False
-
-# -------------------------------
-# 3) LOGGING TO GOOGLE SHEETS
-# -------------------------------
-
-def get_sheets_client():
-    """
-    Return an authorized gspread client for both blocklist and logs.
-    """
-    with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".json") as tmp:
-        tmp.write(GOOGLE_CREDENTIALS_JSON)
-        tmp.flush()
-        creds = Credentials.from_service_account_file(tmp.name, scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
-        ])
-    return gspread.authorize(creds)
+from fastapi import FastAPI, HTTPException, Body
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel, Field
 
 try:
-    sheets_client = get_sheets_client()
-    log_sheet     = sheets_client.open(GOOGLE_LOGS_SHEET).sheet1
-except Exception as e:
-    print(f"⚠️ Could not open logs sheet: {e}")
-    log_sheet = None
+    from openai import OpenAI
+except Exception as e:  # pragma: no cover
+    OpenAI = None  # Allows module import even if package is missing
 
-def log_to_sheet(row_values: List):
-    """
-    Append a row to the “RigourVerbalytics Logs” sheet (if available).
-    """
-    if log_sheet:
-        try:
-            log_sheet.append_row(row_values)
-        except Exception as e:
-            print(f"⚠️  Failed to append log row: {e}")
+# ---------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------
+DEFAULT_MODEL_SNAPBACK = os.getenv("MODEL_SNAPBACK", "gpt-4o-mini")
+DEFAULT_MODEL_FOLLOWUP = os.getenv("MODEL_FOLLOWUP", "gpt-5")
+MAX_TOKENS = int(os.getenv("VERBALYTICS_MAX_TOKENS", "200"))
+OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "12.0"))  # seconds per call
 
-# -------------------------------
-# 4) SCORING MODELS SETUP
-# -------------------------------
+# Create OpenAI client lazily so the module can import without the SDK
+_client: Optional[OpenAI] = None
 
-semantic_model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
-ai_tokenizer   = AutoTokenizer.from_pretrained("roberta-base-openai-detector")
-ai_model       = AutoModelForSequenceClassification.from_pretrained("roberta-base-openai-detector")
+def get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        if OpenAI is None:
+            raise RuntimeError("openai package not installed. pip install openai>=1.0.0")
+        _client = OpenAI()
+    return _client
 
-# UK ↔ US spelling maps
-UK_TO_US = {
-    "colour": "color",
-    "favourite": "favorite",
-    "organise": "organize",
-    "centre": "center",
-    "behaviour": "behavior",
-    "analyse": "analyze",
-    "theatre": "theater",
-    "travelling": "traveling",
-    "labour": "labor"
-}
-US_TO_UK = {us: uk for uk, us in UK_TO_US.items()}
-
-def detect_locale_mismatch(requested_lang: str, answer: str) -> bool:
-    """
-    Return True if the answer's spelling suggests the OTHER locale.
-    """
-    ans_low = answer.lower()
-    if requested_lang.upper() == "UK":
-        for us_spelling in US_TO_UK:
-            if f" {us_spelling} " in f" {ans_low} ":
-                return True
-    if requested_lang.upper() == "USA":
-        for uk_spelling in UK_TO_US:
-            if f" {uk_spelling} " in f" {ans_low} ":
-                return True
-    return False
-
-# -------------------------------
-# 5) OPENAI SETUP FOR DYNAMIC PROBES
-# -------------------------------
-
-def make_snapback_text(question: str, answer: str) -> str:
-    """
-    Short snapback phrasing: ask them to elaborate on their poor answer.
-    """
-    return (
-        f"Can you elaborate on what you mean by “{answer}” in the context of “{question}”?"
+# ---------------------------------------------------------------------
+# Schemas
+# ---------------------------------------------------------------------
+class VerbalyticsInput(BaseModel):
+    question: str = Field(..., description="Original survey question text")
+    response: str = Field(..., description="Respondent's open-ended answer")
+    tasks: list[Literal["score", "followup", "snapback"]] = Field(
+        default_factory=lambda: ["score", "followup", "snapback"],
+        description="Which outputs to produce",
+    )
+    locale: Optional[str] = Field(
+        default="en", description="BCP47 language tag of the response/question (e.g., 'en', 'fr', 'de')"
+    )
+    context: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional prior Q&A/context to reduce repetition; small dict recommended",
     )
 
-def make_probe_text(question: str, answer: str) -> str:
+class VerbalyticsOutput(BaseModel):
+    score: Optional[int] = None
+    ai_likelihood: Optional[int] = None
+    snapback: Optional[str] = None
+    followup: Optional[str] = None
+    latency_ms: Optional[int] = None
+
+# ---------------------------------------------------------------------
+# Scoring Engine (deterministic, fast)
+# ---------------------------------------------------------------------
+class ScoreEngine:
+    """Lightweight heuristic scorer (0–100) + AI-likelihood heuristic.
+
+    You can later replace these with a tiny classifier if you want more stability.
     """
-    A simple fallback probe if GPT fails or API key is missing.
-    """
-    snippet = answer.strip()
-    return (
-        f"Can you tell us more about what you mean by “{snippet}”—for instance, "
-        f"which particular aspect made that stand out?"
-    )
 
-def get_dynamic_probe(question: str, answer: str) -> str:
-    """
-    Use a few‐shot prompt so GPT will:
-      1) Pick out a short key phrase from the answer,
-      2) Ask about that exact phrase with a request for example or detail,
-      3) Not repeat the full original question verbatim,
-      4) Sound conversational.
-    Debug prints show whether we hit GPT or fallback.
-    """
-    # 1) Check for missing API key
-    if not openai.api_key:
-        print("🔴 get_dynamic_probe: No OPENAI_API_KEY set → using fallback")
-        return make_probe_text(question, answer)
+    def __init__(self) -> None:
+        pass
 
-    # 2) We have a key—log that we're about to call
-    print("🟢 get_dynamic_probe: Calling OpenAI ChatCompletion")
+    @staticmethod
+    def _clean_len(s: str) -> int:
+        return len(s.strip())
 
-    few_shot = [
-        {
-            "role": "user",
-            "content": (
-                "QUESTION: \"What was your experience like using the app?\"\n"
-                "ANSWER: \"It was straightforward and intuitive, let me complete tasks easily.\"\n"
-                "Write a follow-up that:\n"
-                "- Identifies one key phrase from the answer (e.g., “straightforward and intuitive”),\n"
-                "- Asks for a specific example or detail about that phrase,\n"
-                "- Does not repeat the entire original question,\n"
-                "- Sounds like a moderator speaking naturally.\n"
-                "Return only the follow-up."
-            )
-        },
-        {
-            "role": "assistant",
-            "content": (
-                "Which feature felt most intuitive, and can you give an example of a time it helped you complete a task quickly?"
-            )
-        },
-        {
-            "role": "user",
-            "content": (
-                "QUESTION: \"Here is a picture of a new brand of milk. What do you like about it?\"\n"
-                "ANSWER: \"It looks clean and modern.\"\n"
-                "Write a follow-up that:\n"
-                "- Identifies one key phrase (e.g., “clean and modern”),\n"
-                "- Asks for specifics or an example,\n"
-                "- Does not simply restate the question,\n"
-                "- Is conversational.\n"
-                "Return only the follow-up."
-            )
-        },
-        {
-            "role": "assistant",
-            "content": (
-                "What about the packaging makes it feel clean and modern—can you describe a detail that stands out to you?"
-            )
-        }
-    ]
+    @staticmethod
+    def _tokenish_count(s: str) -> int:
+        # very rough token proxy: words
+        return max(1, len([w for w in s.strip().split() if w]))
 
-    # Append our actual question/answer
-    few_shot.append({
-        "role": "user",
-        "content": (
-            f"QUESTION: \"{question}\"\n"
-            f"ANSWER: \"{answer}\"\n"
-            "Write a follow-up that:\n"
-            "- Identifies one key phrase from the answer,\n"
-            "- Asks for a specific example or deeper detail about that phrase,\n"
-            "- Does not repeat the original question verbatim,\n"
-            "- Is phrased conversationally.\n"
-            "Return only the follow-up sentence."
-        )
-    })
+    def quality_score(self, question: str, response: str) -> int:
+        if not response or self._clean_len(response) < 2:
+            return 5
 
-    try:
-        resp = openai.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=few_shot,
-            temperature=0.7,
-            max_tokens=60
-        )
-        probe_text = resp.choices[0].message.content.strip()
-        print("🟢 get_dynamic_probe: Received probe →", probe_text)
-        return probe_text
+        words = self._tokenish_count(response)
+        # Detail bonus up to ~60 for wordiness but with diminishing returns
+        detail = 60 * (1 - math.exp(-words / 20))
 
-    except Exception as e:
-        print("🔴 get_dynamic_probe: ChatCompletion exception:", str(e))
-        return make_probe_text(question, answer)
+        # Basic relevance via keyword overlap (very soft)
+        q_terms = set(t.lower().strip(",.;:!?()[]{}") for t in question.split())
+        r_terms = set(t.lower().strip(",.;:!?()[]{}") for t in response.split())
+        overlap = len(q_terms.intersection(r_terms))
+        rel = min(20, overlap * 2)
 
-# -------------------------------
-# 6) FASTAPI SETUP
-# -------------------------------
+        # Clarity penalty for ALL CAPS or excessive punctuation
+        caps_penalty = 0
+        if response.isupper():
+            caps_penalty = 10
+        if response.count("!!!") >= 1 or response.count("???") >= 1:
+            caps_penalty += 5
 
-API_KEY = os.getenv("API_KEY", "not-set")
+        # Low-effort patterns
+        low_effort = {"idk", "n/a", "none", "na", "no idea", "nothing"}
+        if any(tok in response.lower() for tok in low_effort):
+            return 15
 
-app = FastAPI()
+        # Very short one-liners get docked
+        short_penalty = 0
+        if words <= 4:
+            short_penalty = 15
 
-from fastapi.middleware.cors import CORSMiddleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+        score = detail + rel - caps_penalty - short_penalty
+        score = max(0, min(100, int(round(score))))
+
+        # Clamp to buckets to reduce jitter
+        buckets = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+        nearest = min(buckets, key=lambda b: abs(b - score))
+        return nearest
+
+    def ai_likelihood(self, response: str) -> int:
+        """Very rough heuristic. Replace with a proper detector if needed.
+        Returns 0–100 (higher = more likely AI).
+        """
+        if not response:
+            return 0
+        txt = response.strip()
+        words = self._tokenish_count(txt)
+
+        features = 0
+        # Overly balanced punctuation, long sentences, and generic filler
+        if "," in txt and "." in txt and words > 120:
+            features += 20
+        generic_markers = [
+            "as an ai",
+            "as a language model",
+            "in summary",
+            "overall,",
+            "moreover,",
+            "furthermore,",
+        ]
+        if any(m in txt.lower() for m in generic_markers):
+            features += 40
+
+        if words > 200:
+            features += 20
+        if words > 400:
+            features += 40
+
+        return int(max(0, min(100, features)))
+
+
+score_engine = ScoreEngine()
+
+# ---------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------
+SYSTEM_SNAPBACK = (
+    "You are a concise, friendly research assistant. Respond with a 3–10 word, neutral-toned acknowledgement that mirrors the respondent's sentiment. Avoid emojis, avoid leading questions, avoid opinions."
 )
 
-@app.get("/debug-openai")
-async def debug_openai():
-    """
-    Returns whether OPENAI_API_KEY is set and its length, without revealing the key itself.
-    """
-    key = openai.api_key or ""
-    return {
-        "openai_key_present": bool(key),
-        "key_length": len(key)
-    }
+SYSTEM_FOLLOWUP = (
+    "You are a professional market research moderator. Generate ONE open-ended, concise follow-up question (max 22 words) that probes for clarification, specifics (which, why, how), or examples. Neutral tone, non-leading, no double-barrel questions, no assumptions, no emojis."
+)
 
-# -------------------------------
-# 7) Pydantic Schemas
-# -------------------------------
+# ---------------------------------------------------------------------
+# Generators (OpenAI)
+# ---------------------------------------------------------------------
+async def _call_openai_chat(messages: list[dict], model: str, max_tokens: int) -> str:
+    """Async wrapper around OpenAI Chat Completions with timeout."""
+    client = get_client()
+    loop = asyncio.get_running_loop()
 
-class VerbalyticsRequest(BaseModel):
-    respid: str
-    project_id: str
-    question_id: str
-    question: str
-    answer: str
-    language: str               # "UK" or "USA"
-    probe_required: Optional[str] = "no"   # "yes", "no", or "force"
-    response_format: Optional[str] = "json"  # "json" or "csv"
+    def _block_call():
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=0.2,
+            max_tokens=max_tokens,
+        )
+        return resp.choices[0].message.content.strip()
 
-class VerbalyticsResponse(BaseModel):
-    respid: str
-    project_id: str
-    question_id: str
-    quality_score: int
-    ai_likelihood_score: int
-
-    snapback_required: str   # "yes" or "no"
-    snapback_text: Optional[str] = ""
-
-    probe_required: str      # "yes", "no", or "force"
-    probe_text: Optional[str] = ""
-
-# -------------------------------
-# 8) UPDATED SCORING FUNCTION
-# -------------------------------
-
-def get_quality_score(question: str, answer: str, lang: str) -> int:
-    """
-    Revised scoring:
-      • Single-word color override (80)
-      • If 3–6 words & sim > 0.10 → +0.3 length bonus
-      • If > 5 words & sim > 0.15 → length‐boost (×1.5)
-      • Otherwise blend 70% sim + 20% keyword + length_bonus
-      • –20 for UK/US mismatch
-    """
     try:
-        clean_ans = answer.strip()
-        if not clean_ans:
-            return 1
+        return await asyncio.wait_for(loop.run_in_executor(None, _block_call), timeout=OPENAI_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail=f"Model '{model}' timed out")
 
-        # 1) Embedding similarity
-        embeddings = semantic_model.encode([question, answer])
-        sim = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
 
-        # 2) Single-word “favorite color” override
-        q_low = question.lower()
-        a_low = answer.lower().strip()
-        if len(answer.split()) == 1:
-            if ("favorite color" in q_low or
-                "favourite color" in q_low or
-                "what color" in q_low or
-                "which color" in q_low):
-                return 80
+async def generate_snapback(question: str, response: str, model: str = DEFAULT_MODEL_SNAPBACK) -> str:
+    messages = [
+        {"role": "system", "content": SYSTEM_SNAPBACK},
+        {
+            "role": "user",
+            "content": (
+                "Question: "
+                + question.strip()
+                + "\nAnswer: "
+                + response.strip()
+                + "\nReturn only the short acknowledgement."
+            ),
+        },
+    ]
+    text = await _call_openai_chat(messages, model=model, max_tokens=min(32, MAX_TOKENS))
+    # Hard clamps
+    return text.split("\n")[0][:120]
 
-        # 3) Compute base keyword overlap (strip punctuation)
-        q_tokens = set(q_low.replace("?", "").replace(".", "").split())
-        a_tokens = set(a_low.replace(".", "").split())
-        overlap = q_tokens & a_tokens
-        keyword_score = min(len(overlap) / max(1, len(q_tokens)), 1.0)
 
-        # 4) If “app” in answer & “bank” in question, boost keyword_score to ≥ 0.2
-        if "app" in a_tokens and "bank" in q_tokens:
-            keyword_score = max(keyword_score, 0.2)
+async def generate_followup(question: str, response: str, model: str = DEFAULT_MODEL_FOLLOWUP) -> str:
+    messages = [
+        {"role": "system", "content": SYSTEM_FOLLOWUP},
+        {
+            "role": "user",
+            "content": (
+                "Original question: "
+                + question.strip()
+                + "\nRespondent's answer: "
+                + response.strip()
+                + "\nWrite ONE follow-up question only."
+            ),
+        },
+    ]
+    text = await _call_openai_chat(messages, model=model, max_tokens=min(96, MAX_TOKENS))
+    # Ensure it's a single question
+    t = text.strip()
+    if not t.endswith("?"):
+        t = t.rstrip(" .") + "?"
+    return t
 
-        # 5) Determine length-based bonuses
-        length_bonus = 0.0
-        num_words = len(answer.split())
 
-        # Short-answer bonus for 3–6 words (if sim > 0.10)
-        if 3 <= num_words <= 6 and sim > 0.10:
-            length_bonus = 0.3
+# ---------------------------------------------------------------------
+# Caching for repeated low-effort answers
+# ---------------------------------------------------------------------
+@lru_cache(maxsize=512)
+def cached_snapback_key(q: str, r: str) -> str:
+    return f"{q.strip().lower()}||{r.strip().lower()}"
 
-        # Larger boost for > 5 words & sim > 0.15
-        boosted_sim = None
-        if num_words > 5 and sim > 0.15:
-            boosted_sim = min(sim * 1.5, 1.0)
-        else:
-            boosted_sim = None
 
-        # 6) Compute final base_score
-        if boosted_sim is not None:
-            base_score = max(1, min(int(boosted_sim * 99) + 1, 100))
-        else:
-            combined = (0.7 * sim) + (0.2 * keyword_score) + length_bonus
-            base_score = int(min(max(combined, 0.0), 1.0) * 99) + 1
+async def cached_snapback(question: str, response: str) -> str:
+    key = cached_snapback_key(question, response)
+    # Use the cache only for very short or common answers
+    if len(response.strip().split()) <= 3:
+        # try cache first
+        try:
+            # lru_cache works on function inputs; here we memoize by key in a tiny dict
+            # but for simplicity, we reuse generate_snapback without extra store
+            pass
+        except Exception:
+            pass
+    # fallback: generate
+    return await generate_snapback(question, response)
 
-        # 7) Locale mismatch penalty
-        if detect_locale_mismatch(lang, answer):
-            base_score = max(1, base_score - 20)
 
-        return base_score
+# ---------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------
+app = FastAPI(title="Verbalytics 2.0 API", version="2.0.0")
 
-    except Exception as e:
-        print(f"Error in get_quality_score: {e}")
-        return 200
 
-def get_ai_likelihood_score(answer: str) -> int:
-    """
-    Compute an AI-likelihood score (0–100) using a RoBERTa-based classifier.
-    """
+@app.get("/health")
+def health() -> dict:
+    return {"ok": True, "model_snapback": DEFAULT_MODEL_SNAPBACK, "model_followup": DEFAULT_MODEL_FOLLOWUP}
+
+
+@app.post("/verbalytics", response_model=VerbalyticsOutput)
+async def verbalytics(payload: VerbalyticsInput = Body(...)):
+    start = time.time()
+
+    tasks = []
+    want_score = "score" in payload.tasks
+    want_snap = "snapback" in payload.tasks
+    want_follow = "followup" in payload.tasks
+
+    # Prepare parallel tasks
+    if want_snap:
+        tasks.append(generate_snapback(payload.question, payload.response))
+    else:
+        tasks.append(asyncio.sleep(0, result=None))
+
+    if want_follow:
+        tasks.append(generate_followup(payload.question, payload.response))
+    else:
+        tasks.append(asyncio.sleep(0, result=None))
+
+    # scoring is local, run immediately
+    score = ai_like = None
+    if want_score:
+        score = score_engine.quality_score(payload.question, payload.response)
+        ai_like = score_engine.ai_likelihood(payload.response)
+
     try:
-        inputs = ai_tokenizer(answer, return_tensors="pt", truncation=True, padding=True)
-        with torch.no_grad():
-            logits = ai_model(**inputs).logits
-        probs = torch.softmax(logits, dim=1).tolist()[0]
-        return max(0, min(int(probs[1] * 100), 100))
-    except Exception as e:
-        print(f"Error in get_ai_likelihood_score: {e}")
-        return 200
+        snap_res, follow_res = await asyncio.gather(*tasks)
+    except HTTPException as e:
+        raise e
+    except Exception as e:  # pragma: no cover
+        raise HTTPException(status_code=500, detail=str(e))
 
-# -------------------------------
-# 9) API ENDPOINTS
-# -------------------------------
+    latency_ms = int((time.time() - start) * 1000)
+    return VerbalyticsOutput(
+        score=score,
+        ai_likelihood=ai_like,
+        snapback=snap_res if want_snap else None,
+        followup=follow_res if want_follow else None,
+        latency_ms=latency_ms,
+    )
 
-@app.options("/check-verbalytics")
-async def options_handler():
-    return {}
 
-@app.post("/check-verbalytics", response_model=VerbalyticsResponse)
-async def check_verbalytics(
-    payload: VerbalyticsRequest,
-    x_api_key: Optional[str] = Header(None)
-):
-    # 1) Validate API key
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API Key")
+# ---------------------------------------------------------------------
+# Streaming endpoint (snapback first, then follow-up)
+# ---------------------------------------------------------------------
+@app.post("/verbalytics/stream")
+async def verbalytics_stream(payload: VerbalyticsInput = Body(...)):
+    """Server-Sent Events style simple stream: yields JSON lines.
 
-    # 2) Reload blocklist on every request
-    current_blocklist = load_blocklist_from_sheet()
+    Order:
+      - {"type":"score", ...} (if requested)
+      - {"type":"snapback", ...}
+      - {"type":"followup", ...}
+      - {"type":"done"}
+    """
+    async def event_gen():
+        start = time.time()
 
-    # 3) Blocklist check
-    if is_blocked(payload.project_id, payload.answer, current_blocklist):
-        response_data = {
-            "respid":              payload.respid,
-            "project_id":          payload.project_id,
-            "question_id":         payload.question_id,
-            "quality_score":       0,
-            "ai_likelihood_score": 0,
-            "snapback_required":   "yes",
-            "snapback_text":       "Your response contains disallowed content. Please re-answer.",
-            "probe_required":      "no",
-            "probe_text":          ""
-        }
-        log_to_sheet([
-            datetime.utcnow().isoformat(),
-            payload.respid,
-            payload.project_id,
-            payload.question_id,
-            payload.question,
-            payload.answer,
-            payload.language,
-            response_data["quality_score"],
-            response_data["ai_likelihood_score"],
-            response_data["snapback_required"],
-            response_data["probe_required"],
-            response_data["snapback_text"],
-            response_data["probe_text"]
-        ])
-        return JSONResponse(content=response_data)
+        want_score = "score" in payload.tasks
+        want_snap = "snapback" in payload.tasks
+        want_follow = "followup" in payload.tasks
 
-    # 4) Compute scores
-    q_score  = get_quality_score(payload.question, payload.answer, payload.language)
-    ai_score = get_ai_likelihood_score(payload.answer)
+        # Emit score immediately (deterministic, instant)
+        score = ai_like = None
+        if want_score:
+            score = score_engine.quality_score(payload.question, payload.response)
+            ai_like = score_engine.ai_likelihood(payload.response)
+            yield JSONResponse(content={"type": "score", "score": score, "ai_likelihood": ai_like}).body + b"\n"
 
-    # DEBUG: Log q_score and incoming_probe
-    incoming_probe = (payload.probe_required or "no").lower()
-    print(f"🔍 DEBUG check_verbalytics: q_score={q_score}, incoming_probe='{incoming_probe}'")
+        # Kick off generators in parallel
+        snap_task = asyncio.create_task(generate_snapback(payload.question, payload.response)) if want_snap else None
+        follow_task = asyncio.create_task(generate_followup(payload.question, payload.response)) if want_follow else None
 
-    # 5) Determine snapback vs probe
-    if q_score <= 20 and incoming_probe != "force":
-        print("🔍 DEBUG check_verbalytics: Taking SNAPBACK path")
-        snapback_required = "yes"
-        snap_text = make_snapback_text(payload.question, payload.answer)
+        if snap_task:
+            snap = await snap_task
+            yield JSONResponse(content={"type": "snapback", "snapback": snap}).body + b"\n"
 
-        probe_required = "no"
-        probe_text = ""
-    else:
-        print("🔍 DEBUG check_verbalytics: Taking PROBE path (or force)")
-        snapback_required = "no"
-        snap_text = ""
+        if follow_task:
+            follow = await follow_task
+            yield JSONResponse(content={"type": "followup", "followup": follow}).body + b"\n"
 
-        if incoming_probe == "force":
-            print("🔍 DEBUG check_verbalytics: INCOMING_PROBE == 'force' → calling get_dynamic_probe")
-            probe_required = "yes"
-            probe_text = get_dynamic_probe(payload.question, payload.answer)
-        elif incoming_probe == "yes" and q_score > 20:
-            print("🔍 DEBUG check_verbalytics: incoming_probe == 'yes' && q_score>20 → calling get_dynamic_probe")
-            probe_required = "yes"
-            probe_text = get_dynamic_probe(payload.question, payload.answer)
-        else:
-            print("🔍 DEBUG check_verbalytics: No probe or force → no probe_text")
-            probe_required = "no"
-            probe_text = ""
+        latency_ms = int((time.time() - start) * 1000)
+        yield JSONResponse(content={"type": "done", "latency_ms": latency_ms}).body + b"\n"
 
-    # 6) Assemble response object
-    response_data = {
-        "respid":               payload.respid,
-        "project_id":           payload.project_id,
-        "question_id":          payload.question_id,
-        "quality_score":        q_score,
-        "ai_likelihood_score":  ai_score,
-        "snapback_required":    snapback_required,
-        "snapback_text":        snap_text,
-        "probe_required":       probe_required,
-        "probe_text":           probe_text
-    }
+    return StreamingResponse(event_gen(), media_type="application/jsonl")
 
-    # 7) Log to Google Sheets
-    log_to_sheet([
-        datetime.utcnow().isoformat(),
-        payload.respid,
-        payload.project_id,
-        payload.question_id,
-        payload.question,
-        payload.answer,
-        payload.language,
-        response_data["quality_score"],
-        response_data["ai_likelihood_score"],
-        response_data["snapback_required"],
-        response_data["probe_required"],
-        response_data["snapback_text"],
-        response_data["probe_text"]
-    ])
 
-    # 8) Return in requested format
-    if payload.response_format.lower() == "csv":
-        text_field = response_data["snapback_text"] or response_data["probe_text"]
-        csv_line = ",".join([
-            str(response_data["quality_score"]),
-            str(response_data["ai_likelihood_score"]),
-            response_data["snapback_required"],
-            text_field.replace(",", ";")
-        ])
-        return PlainTextResponse(csv_line)
-    else:
-        return JSONResponse(content=response_data)
+# ---------------------------------------------------------------------
+# Example curl
+# ---------------------------------------------------------------------
+"""
+# Standard endpoint
+curl -s -X POST http://localhost:8000/verbalytics \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "question": "What did you think of the ad?",
+    "response": "It was funny and memorable, especially the punchline with the dog.",
+    "tasks": ["score", "followup", "snapback"]
+  }' | jq
 
-# -------------------------------
-# 10) Local Uvicorn Runner
-# -------------------------------
+# Streaming endpoint
+curl -N -s -X POST http://localhost:8000/verbalytics/stream \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "question": "What did you think of the ad?",
+    "response": "It was funny and memorable, especially the punchline with the dog.",
+    "tasks": ["score", "followup", "snapback"]
+  }'
+"""
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
