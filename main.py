@@ -195,7 +195,7 @@ async def _call_openai_chat(messages: list[dict], model: str, max_tokens: int) -
             model=model,
             messages=messages,
             temperature=0.2,
-            max_tokens=max_tokens,
+            max_completion_tokens=max_tokens,  # <-- updated here
         )
         return resp.choices[0].message.content.strip()
 
@@ -258,14 +258,10 @@ async def cached_snapback(question: str, response: str) -> str:
     key = cached_snapback_key(question, response)
     # Use the cache only for very short or common answers
     if len(response.strip().split()) <= 3:
-        # try cache first
         try:
-            # lru_cache works on function inputs; here we memoize by key in a tiny dict
-            # but for simplicity, we reuse generate_snapback without extra store
             pass
         except Exception:
             pass
-    # fallback: generate
     return await generate_snapback(question, response)
 
 
@@ -289,7 +285,6 @@ async def verbalytics(payload: VerbalyticsInput = Body(...)):
     want_snap = "snapback" in payload.tasks
     want_follow = "followup" in payload.tasks
 
-    # Prepare parallel tasks
     if want_snap:
         tasks.append(generate_snapback(payload.question, payload.response))
     else:
@@ -300,7 +295,6 @@ async def verbalytics(payload: VerbalyticsInput = Body(...)):
     else:
         tasks.append(asyncio.sleep(0, result=None))
 
-    # scoring is local, run immediately
     score = ai_like = None
     if want_score:
         score = score_engine.quality_score(payload.question, payload.response)
@@ -310,7 +304,7 @@ async def verbalytics(payload: VerbalyticsInput = Body(...)):
         snap_res, follow_res = await asyncio.gather(*tasks)
     except HTTPException as e:
         raise e
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
     latency_ms = int((time.time() - start) * 1000)
@@ -323,19 +317,8 @@ async def verbalytics(payload: VerbalyticsInput = Body(...)):
     )
 
 
-# ---------------------------------------------------------------------
-# Streaming endpoint (snapback first, then follow-up)
-# ---------------------------------------------------------------------
 @app.post("/verbalytics/stream")
 async def verbalytics_stream(payload: VerbalyticsInput = Body(...)):
-    """Server-Sent Events style simple stream: yields JSON lines.
-
-    Order:
-      - {"type":"score", ...} (if requested)
-      - {"type":"snapback", ...}
-      - {"type":"followup", ...}
-      - {"type":"done"}
-    """
     async def event_gen():
         start = time.time()
 
@@ -343,14 +326,11 @@ async def verbalytics_stream(payload: VerbalyticsInput = Body(...)):
         want_snap = "snapback" in payload.tasks
         want_follow = "followup" in payload.tasks
 
-        # Emit score immediately (deterministic, instant)
-        score = ai_like = None
         if want_score:
             score = score_engine.quality_score(payload.question, payload.response)
             ai_like = score_engine.ai_likelihood(payload.response)
             yield JSONResponse(content={"type": "score", "score": score, "ai_likelihood": ai_like}).body + b"\n"
 
-        # Kick off generators in parallel
         snap_task = asyncio.create_task(generate_snapback(payload.question, payload.response)) if want_snap else None
         follow_task = asyncio.create_task(generate_followup(payload.question, payload.response)) if want_follow else None
 
@@ -366,28 +346,3 @@ async def verbalytics_stream(payload: VerbalyticsInput = Body(...)):
         yield JSONResponse(content={"type": "done", "latency_ms": latency_ms}).body + b"\n"
 
     return StreamingResponse(event_gen(), media_type="application/jsonl")
-
-
-# ---------------------------------------------------------------------
-# Example curl
-# ---------------------------------------------------------------------
-"""
-# Standard endpoint
-curl -s -X POST http://localhost:8000/verbalytics \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "question": "What did you think of the ad?",
-    "response": "It was funny and memorable, especially the punchline with the dog.",
-    "tasks": ["score", "followup", "snapback"]
-  }' | jq
-
-# Streaming endpoint
-curl -N -s -X POST http://localhost:8000/verbalytics/stream \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "question": "What did you think of the ad?",
-    "response": "It was funny and memorable, especially the punchline with the dog.",
-    "tasks": ["score", "followup", "snapback"]
-  }'
-"""
-
