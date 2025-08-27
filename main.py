@@ -42,7 +42,7 @@ DEFAULT_MODEL_FOLLOWUP = os.getenv("MODEL_FOLLOWUP", "gpt-5")
 MAX_TOKENS = int(os.getenv("VERBALYTICS_MAX_TOKENS", "200"))
 OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "12.0"))
 
-BLOCKLIST_CSV_URL = os.getenv("GOOGLE_BLOCKLIST_SHEET", "")
+BLOCKLIST_CSV_URL = os.getenv("VERBALYTICS_BLOCKLIST_CSV_URL", "")
 BLOCKLIST_REFRESH_SECONDS = int(os.getenv("VERBALYTICS_BLOCKLIST_REFRESH_SECONDS", "300"))
 
 # ---------------------------------------------------------------------
