@@ -1,13 +1,14 @@
 """
-Verbalytics 2.0 — Fast, Reliable API for Snapback, Follow-up, and Scoring
+Verbalytics 2.1 — Fast, Reliable API for Acknowledgement, Snapback, Follow-up, and Scoring
 -----------------------------------------------------------------------
 - FastAPI with asyncio orchestration
-- Parallel generation (snapback + follow-up) and deterministic scoring
-- Optional streaming of snapback first for super-low perceived latency
+- Parallel generation (ack + snapback + follow-up) and deterministic scoring
+- Optional streaming of outputs for super-low perceived latency
 - Uses OpenAI Python SDK >= 1.0 interface (no ChatCompletion legacy)
 
 ENV VARS (set on Render or your platform):
   - OPENAI_API_KEY
+  - MODEL_ACK (default: gpt-4o-mini)
   - MODEL_SNAPBACK (default: gpt-4o-mini)
   - MODEL_FOLLOWUP (default: gpt-5)
   - VERBALYTICS_MAX_TOKENS (optional override)
@@ -37,6 +38,7 @@ except Exception:
 # ---------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------
+DEFAULT_MODEL_ACK = os.getenv("MODEL_ACK", "gpt-4o-mini")
 DEFAULT_MODEL_SNAPBACK = os.getenv("MODEL_SNAPBACK", "gpt-4o-mini")
 DEFAULT_MODEL_FOLLOWUP = os.getenv("MODEL_FOLLOWUP", "gpt-5")
 MAX_TOKENS = int(os.getenv("VERBALYTICS_MAX_TOKENS", "200"))
@@ -64,7 +66,7 @@ def get_client() -> OpenAI:
 class VerbalyticsInput(BaseModel):
     question: str
     response: str
-    tasks: list[Literal["score","followup","snapback"]] = Field(default_factory=lambda: ["score","followup","snapback"])
+    tasks: list[Literal["score","ack","snapback","followup"]] = Field(default_factory=lambda: ["score","ack","followup"])
     locale: Optional[str] = "en"
     context: Optional[Dict[str, Any]] = None
     project_id: Optional[str] = None
@@ -72,6 +74,7 @@ class VerbalyticsInput(BaseModel):
 class VerbalyticsOutput(BaseModel):
     score: Optional[int] = None
     ai_likelihood: Optional[int] = None
+    ack: Optional[str] = None
     snapback: Optional[str] = None
     followup: Optional[str] = None
     latency_ms: Optional[int] = None
@@ -156,7 +159,8 @@ score_engine=ScoreEngine()
 # ---------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------
-SYSTEM_SNAPBACK=("You are a concise, friendly research assistant. Respond with a 3–10 word acknowledgement that mirrors the respondent's sentiment.")
+SYSTEM_ACK=("You are a concise, friendly research assistant. Respond with a 3–10 word acknowledgement that mirrors the respondent's sentiment.")
+SYSTEM_SNAPBACK=("You are a professional market research moderator. If the respondent's answer is unclear, nonsense, or irrelevant, politely re-ask the original question, making clear the first answer did not address it. Keep neutral tone.")
 SYSTEM_FOLLOWUP=("You are a professional market research moderator. Generate ONE open-ended follow-up question (max 22 words). It must be a single sentence, >=6 words, end with '?' and be neutral.")
 
 # ---------------------------------------------------------------------
@@ -172,16 +176,26 @@ async def _call_openai_chat(messages:list[dict], model:str, max_tokens:int)->str
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504,detail=f"Model '{model}' timed out")
 
-async def generate_snapback(q: str, r: str, project_id: Optional[str] = None, model: str = DEFAULT_MODEL_SNAPBACK) -> str:
-    messages=[{"role":"system","content":SYSTEM_SNAPBACK},{"role":"user","content":f"Q: {q.strip()} A: {r.strip()} Return only acknowledgement."}]
+async def generate_ack(q:str,r:str,project_id:Optional[str]=None,model:str=DEFAULT_MODEL_ACK)->str:
+    messages=[{"role":"system","content":SYSTEM_ACK},{"role":"user","content":f"Q: {q.strip()} A: {r.strip()} Return only acknowledgement."}]
     text=await _call_openai_chat(messages,model,max_tokens=min(24,MAX_TOKENS))
-    snap=text.split("\n")[0][:120]
-    if contains_blocked_phrase(snap, project_id):
-        avoid = ", ".join(sorted(get_block_phrases(project_id)))
+    ack=text.split("\n")[0][:120]
+    if contains_blocked_phrase(ack,project_id):
+        avoid=", ".join(sorted(get_block_phrases(project_id)))
         messages[0]["content"]+=f" Avoid: {avoid}"
-        snap2=await _call_openai_chat(messages,model,max_tokens=min(24,MAX_TOKENS))
-        if not contains_blocked_phrase(snap2, project_id): return snap2
-    return snap
+        ack2=await _call_openai_chat(messages,model,max_tokens=min(24,MAX_TOKENS))
+        if not contains_blocked_phrase(ack2,project_id): return ack2
+    return ack
+
+async def generate_snapback(q:str,r:str,project_id:Optional[str]=None,model:str=DEFAULT_MODEL_SNAPBACK)->Optional[str]:
+    # Only trigger if poor/irrelevant response
+    if not r or len(r.split())<=3:
+        messages=[{"role":"system","content":SYSTEM_SNAPBACK},{"role":"user","content":f"Original question: {q.strip()} Respondent's answer: {r.strip()} Please re-ask the question clearly."}]
+        text=await _call_openai_chat(messages,model,max_tokens=min(48,MAX_TOKENS))
+        snap=text.split("\n")[0][:200]
+        if not contains_blocked_phrase(snap,project_id):
+            return snap
+    return None
 
 def _fallback_followup(q:str,r:str)->str:
     r=(r or "").lower()
@@ -215,19 +229,9 @@ async def generate_followup(question: str, response: str, project_id: Optional[s
     return t
 
 # ---------------------------------------------------------------------
-# Cache
-# ---------------------------------------------------------------------
-@lru_cache(maxsize=512)
-def cached_snapback_key(q:str,r:str)->str: return f"{q.strip().lower()}||{r.strip().lower()}"
-
-async def cached_snapback(q:str,r:str)->str:
-    if len(r.strip().split())<=3: pass
-    return await generate_snapback(q,r)
-
-# ---------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------
-app=FastAPI(title="Verbalytics 2.0 API",version="2.0.0")
+app=FastAPI(title="Verbalytics 2.1 API",version="2.1.0")
 
 @app.on_event("startup")
 async def startup_blocklist(): _refresh_blocklist(True)
@@ -238,26 +242,22 @@ def health() -> dict:
         _refresh_blocklist(False)
     except Exception:
         pass
-    return {"ok": True, "model_snapback": DEFAULT_MODEL_SNAPBACK, "model_followup": DEFAULT_MODEL_FOLLOWUP, "blocklist_version": _block_version}
-
-@app.get("/admin/blocklist")
-async def admin_blocklist(project:Optional[str]=None):
-    phrases=get_block_phrases(project)
-    return {"version":_block_version,"global_count":len(_block_global),"project":project,"merged_count":len(phrases),"phrases":sorted(list(phrases))}
-
-@app.post("/admin/blocklist/refresh")
-async def admin_refresh():
-    _refresh_blocklist(True)
-    return {"ok":True,"version":_block_version,"global_count":len(_block_global),"projects":len(_block_projects)}
+    return {"ok": True, "model_ack": DEFAULT_MODEL_ACK, "model_snapback": DEFAULT_MODEL_SNAPBACK, "model_followup": DEFAULT_MODEL_FOLLOWUP, "blocklist_version": _block_version}
 
 @app.post("/verbalytics", response_model=VerbalyticsOutput)
 async def verbalytics(payload: VerbalyticsInput = Body(...)):
     start = time.time()
 
-    tasks = []
     want_score = "score" in payload.tasks
+    want_ack = "ack" in payload.tasks
     want_snap = "snapback" in payload.tasks
     want_follow = "followup" in payload.tasks
+
+    tasks = []
+    if want_ack:
+        tasks.append(generate_ack(payload.question, payload.response, payload.project_id))
+    else:
+        tasks.append(asyncio.sleep(0, result=None))
 
     if want_snap:
         tasks.append(generate_snapback(payload.question, payload.response, payload.project_id))
@@ -275,7 +275,7 @@ async def verbalytics(payload: VerbalyticsInput = Body(...)):
         ai_like = score_engine.ai_likelihood(payload.response)
 
     try:
-        snap_res, follow_res = await asyncio.gather(*tasks)
+        ack_res, snap_res, follow_res = await asyncio.gather(*tasks)
     except HTTPException as e:
         raise e
     except Exception as e:
@@ -285,6 +285,7 @@ async def verbalytics(payload: VerbalyticsInput = Body(...)):
     return VerbalyticsOutput(
         score=score,
         ai_likelihood=ai_like,
+        ack=ack_res if want_ack else None,
         snapback=snap_res if want_snap else None,
         followup=follow_res if want_follow else None,
         latency_ms=latency_ms,
@@ -296,47 +297,38 @@ async def verbalytics_stream(payload: VerbalyticsInput = Body(...)):
         start = time.time()
 
         want_score = "score" in payload.tasks
-        want_snap = "snapback" in payload.tasks
+        want_ack = "ack" in payload.tasks
         want_follow = "followup" in payload.tasks
+        want_snap = "snapback" in payload.tasks
 
         if want_score:
             score = score_engine.quality_score(payload.question, payload.response)
             ai_like = score_engine.ai_likelihood(payload.response)
-            yield JSONResponse(content={"type": "score", "score": score, "ai_likelihood": ai_like}).body + b"\n"
+            yield JSONResponse(content={"type": "score", "score": score, "ai_likelihood": ai_like}).body + b"
+"
 
-        snap_task = asyncio.create_task(generate_snapback(payload.question, payload.response, payload.project_id)) if want_snap else None
+        ack_task = asyncio.create_task(generate_ack(payload.question, payload.response, payload.project_id)) if want_ack else None
         follow_task = asyncio.create_task(generate_followup(payload.question, payload.response, payload.project_id)) if want_follow else None
+        snap_task = asyncio.create_task(generate_snapback(payload.question, payload.response, payload.project_id)) if want_snap else None
+
+        if ack_task:
+            ack = await ack_task
+            yield JSONResponse(content={"type": "ack", "ack": ack}).body + b"
+"
 
         if snap_task:
             snap = await snap_task
-            yield JSONResponse(content={"type": "snapback", "snapback": snap}).body + b"\n"
+            if snap:
+                yield JSONResponse(content={"type": "snapback", "snapback": snap}).body + b"
+"
 
         if follow_task:
             follow = await follow_task
-            yield JSONResponse(content={"type": "followup", "followup": follow}).body + b"\n"
+            yield JSONResponse(content={"type": "followup", "followup": follow}).body + b"
+"
 
         latency_ms = int((time.time() - start) * 1000)
-        yield JSONResponse(content={"type": "done", "latency_ms": latency_ms}).body + b"\n"
+        yield JSONResponse(content={"type": "done", "latency_ms": latency_ms}).body + b"
+"
 
     return StreamingResponse(event_gen(), media_type="application/jsonl")
-
-# ------------------- Admin: blocklist introspection -------------------
-@app.get("/admin/blocklist/full")
-async def admin_get_blocklist(project: Optional[str] = None):
-    phrases = get_block_phrases(project)
-    with _block_lock:
-        return {
-            "version": _block_version,
-            "loaded_seconds_ago": int(monotonic() - _block_loaded_at) if _block_loaded_at else None,
-            "global_count": len(_block_global),
-            "project": _norm(project) if project else None,
-            "project_count": len(_block_projects.get(_norm(project), set())) if project else None,
-            "merged_count": len(phrases),
-            "phrases": sorted(list(phrases)),
-        }
-
-@app.post("/admin/blocklist/full/refresh")
-async def admin_refresh_blocklist():
-    _refresh_blocklist(True)
-    with _block_lock:
-        return {"ok": True, "version": _block_version, "global_count": len(_block_global), "projects": len(_block_projects)}
