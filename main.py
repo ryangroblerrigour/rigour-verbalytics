@@ -172,15 +172,15 @@ async def _call_openai_chat(messages:list[dict], model:str, max_tokens:int)->str
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504,detail=f"Model '{model}' timed out")
 
-async def generate_snapback(q:str,r:str,model:str=DEFAULT_MODEL_SNAPBACK)->str:
+async def generate_snapback(q: str, r: str, project_id: Optional[str] = None, model: str = DEFAULT_MODEL_SNAPBACK) -> str:
     messages=[{"role":"system","content":SYSTEM_SNAPBACK},{"role":"user","content":f"Q: {q.strip()} A: {r.strip()} Return only acknowledgement."}]
     text=await _call_openai_chat(messages,model,max_tokens=min(24,MAX_TOKENS))
     snap=text.split("\n")[0][:120]
-    if contains_blocked_phrase(snap,None):
-        avoid=", ".join(sorted(get_block_phrases(None)))
+    if contains_blocked_phrase(snap, project_id):
+        avoid = ", ".join(sorted(get_block_phrases(project_id)))
         messages[0]["content"]+=f" Avoid: {avoid}"
         snap2=await _call_openai_chat(messages,model,max_tokens=min(24,MAX_TOKENS))
-        if not contains_blocked_phrase(snap2,None): return snap2
+        if not contains_blocked_phrase(snap2, project_id): return snap2
     return snap
 
 def _fallback_followup(q:str,r:str)->str:
