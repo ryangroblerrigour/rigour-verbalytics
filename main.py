@@ -250,32 +250,23 @@ async def verbalytics(payload: VerbalyticsInput = Body(...)):
 
     want_score = "score" in payload.tasks
     want_ack = "ack" in payload.tasks
-    want_snap = "snapback" in payload.tasks
     want_follow = "followup" in payload.tasks
 
-    tasks = []
-    if want_ack:
-        tasks.append(generate_ack(payload.question, payload.response, payload.project_id))
-    else:
-        tasks.append(asyncio.sleep(0, result=None))
-
-    if want_snap:
-        tasks.append(generate_snapback(payload.question, payload.response, payload.project_id))
-    else:
-        tasks.append(asyncio.sleep(0, result=None))
-
-    if want_follow:
-        tasks.append(generate_followup(payload.question, payload.response, payload.project_id))
-    else:
-        tasks.append(asyncio.sleep(0, result=None))
+    # Always generate snapback automatically
+    snap_task = asyncio.create_task(generate_snapback(payload.question, payload.response, payload.project_id))
+    ack_task = asyncio.create_task(generate_ack(payload.question, payload.response, payload.project_id)) if want_ack else None
+    follow_task = asyncio.create_task(generate_followup(payload.question, payload.response, payload.project_id)) if want_follow else None
 
     score = ai_like = None
     if want_score:
         score = score_engine.quality_score(payload.question, payload.response)
         ai_like = score_engine.ai_likelihood(payload.response)
 
+    ack_res = follow_res = snap_res = None
     try:
-        ack_res, snap_res, follow_res = await asyncio.gather(*tasks)
+        snap_res = await snap_task
+        if ack_task: ack_res = await ack_task
+        if follow_task: follow_res = await follow_task
     except HTTPException as e:
         raise e
     except Exception as e:
@@ -286,7 +277,7 @@ async def verbalytics(payload: VerbalyticsInput = Body(...)):
         score=score,
         ai_likelihood=ai_like,
         ack=ack_res if want_ack else None,
-        snapback=snap_res if want_snap else None,
+        snapback=snap_res,
         followup=follow_res if want_follow else None,
         latency_ms=latency_ms,
     )
@@ -299,36 +290,29 @@ async def verbalytics_stream(payload: VerbalyticsInput = Body(...)):
         want_score = "score" in payload.tasks
         want_ack = "ack" in payload.tasks
         want_follow = "followup" in payload.tasks
-        want_snap = "snapback" in payload.tasks
 
         if want_score:
             score = score_engine.quality_score(payload.question, payload.response)
             ai_like = score_engine.ai_likelihood(payload.response)
-            yield JSONResponse(content={"type": "score", "score": score, "ai_likelihood": ai_like}).body + b"
-"
+            yield JSONResponse(content={"type": "score", "score": score, "ai_likelihood": ai_like}).body + b"\n"
 
+        snap_task = asyncio.create_task(generate_snapback(payload.question, payload.response, payload.project_id))
         ack_task = asyncio.create_task(generate_ack(payload.question, payload.response, payload.project_id)) if want_ack else None
         follow_task = asyncio.create_task(generate_followup(payload.question, payload.response, payload.project_id)) if want_follow else None
-        snap_task = asyncio.create_task(generate_snapback(payload.question, payload.response, payload.project_id)) if want_snap else None
+
+        snap = await snap_task
+        if snap:
+            yield JSONResponse(content={"type": "snapback", "snapback": snap}).body + b"\n"
 
         if ack_task:
             ack = await ack_task
-            yield JSONResponse(content={"type": "ack", "ack": ack}).body + b"
-"
-
-        if snap_task:
-            snap = await snap_task
-            if snap:
-                yield JSONResponse(content={"type": "snapback", "snapback": snap}).body + b"
-"
+            yield JSONResponse(content={"type": "ack", "ack": ack}).body + b"\n"
 
         if follow_task:
             follow = await follow_task
-            yield JSONResponse(content={"type": "followup", "followup": follow}).body + b"
-"
+            yield JSONResponse(content={"type": "followup", "followup": follow}).body + b"\n"
 
         latency_ms = int((time.time() - start) * 1000)
-        yield JSONResponse(content={"type": "done", "latency_ms": latency_ms}).body + b"
-"
+        yield JSONResponse(content={"type": "done", "latency_ms": latency_ms}).body + b"\n"
 
     return StreamingResponse(event_gen(), media_type="application/jsonl")
