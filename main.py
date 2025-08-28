@@ -66,7 +66,7 @@ def get_client() -> OpenAI:
 class VerbalyticsInput(BaseModel):
     question: str
     response: str
-    tasks: list[Literal["score","ack","snapback","followup"]] = Field(default_factory=lambda: ["score","ack","followup"])
+    tasks: list[Literal["score","ack","followup"]] = Field(default_factory=lambda: ["score","ack","followup"])
     locale: Optional[str] = "en"
     context: Optional[Dict[str, Any]] = None
     project_id: Optional[str] = None
