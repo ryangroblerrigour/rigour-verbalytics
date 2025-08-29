@@ -77,6 +77,7 @@ class VerbalyticsOutput(BaseModel):
     ack: Optional[str] = None
     snapback: Optional[str] = None
     followup: Optional[str] = None
+    input_blocked_phrases: Optional[list[str]] = None
     latency_ms: Optional[int] = None
 
 # ---------------------------------------------------------------------
@@ -127,6 +128,14 @@ def contains_blocked_phrase(text:str, project_id:Optional[str]) -> bool:
     if not text: return False
     lt=text.lower()
     return any(p in lt for p in get_block_phrases(project_id))
+
+def find_blocked_phrases(text: str, project_id: Optional[str]) -> list[str]:
+    if not text:
+        return []
+    lt = text.lower()
+    phrases = get_block_phrases(project_id)
+    hits = {p for p in phrases if p and p in lt}
+    return sorted(list(hits))
 
 # ---------------------------------------------------------------------
 # Scoring Engine
@@ -233,6 +242,9 @@ async def generate_followup(question: str, response: str, project_id: Optional[s
 # ---------------------------------------------------------------------
 app=FastAPI(title="Verbalytics 2.1 API",version="2.1.0")
 
+# Input blocklist handling mode: off | flag | reject
+INPUT_BLOCK_MODE = os.getenv("VERBALYTICS_BLOCK_INPUT_MODE", "flag").lower()
+
 @app.on_event("startup")
 async def startup_blocklist(): _refresh_blocklist(True)
 
@@ -242,11 +254,19 @@ def health() -> dict:
         _refresh_blocklist(False)
     except Exception:
         pass
-    return {"ok": True, "model_ack": DEFAULT_MODEL_ACK, "model_snapback": DEFAULT_MODEL_SNAPBACK, "model_followup": DEFAULT_MODEL_FOLLOWUP, "blocklist_version": _block_version}
+    with _block_lock:
+        global_count = len(_block_global)
+        project_count = len(_block_projects)
+    return {"ok": True, "model_ack": DEFAULT_MODEL_ACK, "model_snapback": DEFAULT_MODEL_SNAPBACK, "model_followup": DEFAULT_MODEL_FOLLOWUP, "blocklist_version": _block_version, "blocklist_global_count": global_count, "blocklist_projects": project_count}
 
 @app.post("/verbalytics", response_model=VerbalyticsOutput)
 async def verbalytics(payload: VerbalyticsInput = Body(...)):
     start = time.time()
+
+    # Check input against blocklist (question + response)
+    input_hits = sorted(set(find_blocked_phrases(payload.question, payload.project_id) + find_blocked_phrases(payload.response, payload.project_id)))
+    if input_hits and INPUT_BLOCK_MODE == "reject":
+        raise HTTPException(status_code=422, detail={"message": "Input contains blocked phrases", "phrases": input_hits})
 
     want_score = "score" in payload.tasks
     want_ack = "ack" in payload.tasks
@@ -279,6 +299,7 @@ async def verbalytics(payload: VerbalyticsInput = Body(...)):
         ack=ack_res if want_ack else None,
         snapback=snap_res,
         followup=follow_res if want_follow else None,
+        input_blocked_phrases=input_hits if input_hits else None,
         latency_ms=latency_ms,
     )
 
@@ -316,3 +337,29 @@ async def verbalytics_stream(payload: VerbalyticsInput = Body(...)):
         yield JSONResponse(content={"type": "done", "latency_ms": latency_ms}).body + b"\n"
 
     return StreamingResponse(event_gen(), media_type="application/jsonl")
+
+# ---------------- Admin: Blocklist Introspection & Refresh ----------------
+@app.get("/admin/blocklist")
+async def admin_blocklist(project: Optional[str] = None):
+    phrases = get_block_phrases(project)
+    with _block_lock:
+        return {
+            "version": _block_version,
+            "global_count": len(_block_global),
+            "projects_map_count": len(_block_projects),
+            "project": _norm(project) if project else None,
+            "project_specific_count": len(_block_projects.get(_norm(project), set())) if project else None,
+            "merged_count": len(phrases),
+            "phrases": sorted(list(phrases)),
+        }
+
+@app.post("/admin/blocklist/refresh")
+async def admin_blocklist_refresh():
+    _refresh_blocklist(True)
+    with _block_lock:
+        return {
+            "ok": True,
+            "version": _block_version,
+            "global_count": len(_block_global),
+            "projects_map_count": len(_block_projects),
+        }
