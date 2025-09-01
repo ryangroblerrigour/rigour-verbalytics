@@ -1,24 +1,6 @@
-# Core web stack
 fastapi>=0.110,<1.0
 uvicorn[standard]>=0.27
 pydantic>=2.6,<3
-
-# OpenAI SDK v1 (we use `from openai import OpenAI`)
 openai>=1.0.0
-
-# Needed for Google Sheet CSV fetch
 requests>=2.31
-
-# Your existing libs (keep only if you actually use them)
-sentence-transformers
-scikit-learn
-transformers
-torch
-
-# Google Sheets helpers (only if still used elsewhere)
-gspread
-google-auth
-
-# Optional
 python-dotenv
-
