@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 try:
     from openai import OpenAI
 except Exception:
-    OpenAI = None
+    OpenAI = None  # service will error at call-time if not installed
 
 # ---------------------------------------------------------------------
 # Config
@@ -156,12 +156,9 @@ def find_blocked_phrases(text: str, project_id: Optional[str]) -> list[str]:
 # Scoring Engine (Subscores + improved AI-likeness)
 # ---------------------------------------------------------------------
 class ScoreEngine:
-    # --- helpers ---
+    # helpers
     def _tokens(self, s: str) -> list[str]:
         return [t.lower().strip(",.;:!?()[]{}\"'") for t in (s or "").split() if t.strip()]
-
-    def _word_count(self, s: str) -> int:
-        return len(self._tokens(s))
 
     def _jaccard(self, a: set[str], b: set[str]) -> float:
         if not a or not b:
@@ -170,7 +167,7 @@ class ScoreEngine:
         union = len(a | b)
         return inter / union if union else 0.0
 
-    # --- subscores ---
+    # subscores
     def subscores(self, question: str, response: str) -> dict:
         q = (question or "").strip()
         r = (response or "").strip()
@@ -191,7 +188,7 @@ class ScoreEngine:
         spec_bonus = 10 * has_reason + 6 * has_locators + min(24, unique_terms)
         specificity = max(0, min(100, int(spec_base + spec_bonus)))
 
-        # Concreteness (UPDATED): first-hand usage + context + feature/sensory + examples + light proper-noun weight
+        # Concreteness (updated): first-hand usage + context + feature/sensory + examples + light proper-noun
         first_hand_markers = {
             "i use", "i used", "i tried", "i've used", "i have used", "i bought", "we bought",
             "my kids use", "my kid uses", "my children", "my family", "we use", "i saw", "i heard", "i've seen"
@@ -230,4 +227,300 @@ class ScoreEngine:
         concreteness = max(0, min(100, int(conc_score)))
 
         # Relevance: lexical overlap; penalize off-topic markers
-        rel_overl_
+        rel_overlap = 100 * self._jaccard(q_toks, r_set)
+        off_topic_markers = {"idk","no","none","whatever","random","unrelated"}
+        off = any(t in r_set for t in off_topic_markers)
+        relevance = max(0, min(100, int(rel_overlap - (25 if off else 0))))
+
+        # Clarity: sentence length, filler/hedging
+        sentences = [s for s in r.replace("!", ".").split(".") if s.strip()]
+        avg_len = (sum(len(self._tokens(s)) for s in sentences)/len(sentences)) if sentences else wc
+        too_long = avg_len > 28
+        too_short = avg_len < 3
+        fillers = {"like","basically","sort of","kind of","you know","stuff","things"}
+        hedge = any(f in " ".join(r_toks) for f in fillers)
+        clarity_base = 80
+        clarity_pen = (15 if too_long else 0) + (15 if too_short else 0) + (10 if hedge else 0)
+        clarity = max(0, min(100, int(clarity_base - clarity_pen)))
+
+        return {
+            "specificity": specificity,
+            "concreteness": concreteness,
+            "relevance": relevance,
+            "clarity": clarity,
+        }
+
+    def quality_score(self, q: str, r: str) -> int:
+        ss = self.subscores(q, r)
+        avg = (ss["specificity"] + ss["concreteness"] + ss["relevance"] + ss["clarity"]) / 4
+        return max(0, min(100, int(round(avg / 10) * 10)))
+
+    def ai_likelihood(self, r: str) -> int:
+        if not r:
+            return 0
+        # lightweight heuristic for now
+        toks = self._tokens(r)
+        wc = len(toks)
+        base = 0 if wc < 15 else 10
+        templ = [
+            "as an ai", "as a language model", "overall,", "moreover,", "furthermore,",
+            "in summary", "in conclusion", "additionally,", "importantly,"
+        ]
+        templ_hits = sum(1 for t in templ if t in r.lower())
+        verbose = 20 if wc > 180 else 0
+        very_verbose = 20 if wc > 350 else 0
+        sents = [s.strip() for s in r.replace("!", ".").split(".") if s.strip()]
+        lengths = [len(self._tokens(s)) for s in sents] or [wc]
+        var = (max(lengths) - min(lengths))
+        low_var = 15 if (len(lengths) >= 3 and var <= 4) else 0
+        rep = 15 if len(set(toks)) / (wc or 1) < 0.45 else 0
+        score = base + templ_hits*20 + verbose + very_verbose + low_var + rep
+        return int(max(0, min(100, score)))
+
+score_engine = ScoreEngine()
+
+# ---------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------
+SYSTEM_ACK = (
+    "You are a concise, friendly research assistant. Respond with a 3–10 word acknowledgement that mirrors the respondent's sentiment."
+)
+SYSTEM_SNAPBACK = (
+    "You are a professional market research moderator. If the respondent's answer is unclear, nonsense, or irrelevant, "
+    "politely re-ask the original question, making clear the first answer did not address it. Keep neutral tone."
+)
+SYSTEM_FOLLOWUP = (
+    "You are a professional market research moderator. Generate ONE open-ended follow-up question (max 22 words). "
+    "It must be a single sentence, >=6 words, end with '?' and be neutral."
+)
+
+# ---------------------------------------------------------------------
+# Generators (OpenAI)
+# ---------------------------------------------------------------------
+async def _call_openai_chat(messages: list[dict], model: str, max_tokens: int) -> str:
+    client = get_client()
+    loop = asyncio.get_running_loop()
+
+    def _block_call():
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_completion_tokens=max_tokens
+        )
+        return resp.choices[0].message.content.strip()
+
+    try:
+        return await asyncio.wait_for(loop.run_in_executor(None, _block_call), timeout=OPENAI_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail=f"Model '{model}' timed out")
+
+async def generate_ack(q: str, r: str, project_id: Optional[str] = None, model: str = DEFAULT_MODEL_ACK) -> str:
+    messages = [
+        {"role": "system", "content": SYSTEM_ACK},
+        {"role": "user", "content": f"Q: {q.strip()} A: {r.strip()} Return only acknowledgement."},
+    ]
+    text = await _call_openai_chat(messages, model, max_tokens=min(24, MAX_TOKENS))
+    ack = text.split("\n")[0][:120]
+    if contains_blocked_phrase(ack, project_id):
+        avoid = ", ".join(sorted(get_block_phrases(project_id)))
+        messages[0]["content"] += f" Avoid: {avoid}"
+        ack2 = await _call_openai_chat(messages, model, max_tokens=min(24, MAX_TOKENS))
+        if not contains_blocked_phrase(ack2, project_id):
+            return ack2
+    return ack
+
+async def generate_snapback(q: str, r: str, project_id: Optional[str] = None, model: str = DEFAULT_MODEL_SNAPBACK) -> Optional[str]:
+    # Only trigger if poor/irrelevant response (very short or empty)
+    if not r or len(r.split()) <= 3:
+        messages = [
+            {"role": "system", "content": SYSTEM_SNAPBACK},
+            {"role": "user", "content": f"Original question: {q.strip()} Respondent's answer: {r.strip()} Please re-ask the question clearly."},
+        ]
+        text = await _call_openai_chat(messages, model, max_tokens=min(48, MAX_TOKENS))
+        snap = text.split("\n")[0][:200]
+        if not contains_blocked_phrase(snap, project_id):
+            return snap
+    return None
+
+def _fallback_followup(q: str, r: str) -> str:
+    rlow = (r or "").lower()
+    if any(k in rlow for k in ["funny","humor","humour","memorable","like","love","enjoy"]): return "What specifically made it stand out for you?"
+    if any(k in rlow for k in ["confusing","unclear","didn't get","dont get","don't get","did not get"]): return "Which part felt confusing, and why?"
+    if any(k in rlow for k in ["boring","slow","long"]): return "What made it feel boring, and how could it be improved?"
+    if len(rlow.split()) <= 3: return "Could you share a bit more detail about that?"
+    return "Can you give a specific example of what you mean?"
+
+async def generate_followup(question: str, response: str, project_id: Optional[str] = None, model: str = DEFAULT_MODEL_FOLLOWUP) -> str:
+    messages = [
+        {"role": "system", "content": SYSTEM_FOLLOWUP},
+        {"role": "user", "content": f"Original question: {question.strip()} Respondent's answer: {response.strip()} Write ONE follow-up question only."},
+    ]
+    text = await _call_openai_chat(messages, model=model, max_tokens=min(96, MAX_TOKENS))
+    t = (text or "").strip().replace("\n", " ")
+    if not t or t == "?" or len(t.split()) < 6:
+        t = _fallback_followup(question, response)
+    if not t.endswith("?"):
+        t = t.rstrip(" .!") + "?"
+    if contains_blocked_phrase(t, project_id):
+        avoid = ", ".join(sorted(list(get_block_phrases(project_id))))
+        messages2 = [
+            {"role": "system", "content": SYSTEM_FOLLOWUP + (" Avoid any of these terms: " + avoid if avoid else "")},
+            {"role": "user", "content": f"Original question: {question.strip()} Respondent's answer: {response.strip()} Write ONE follow-up question only."},
+        ]
+        text2 = await _call_openai_chat(messages2, model=model, max_tokens=min(96, MAX_TOKENS))
+        t2 = (text2 or "").strip().replace("\n", " ")
+        if t2 and t2 != "?" and len(t2.split()) >= 6 and t2.endswith("?") and not contains_blocked_phrase(t2, project_id):
+            t = t2
+    return t
+
+# ---------------------------------------------------------------------
+# FastAPI app (TOP-LEVEL — this fixes the "app not found")
+# ---------------------------------------------------------------------
+app = FastAPI(title="Verbalytics 2.2 API", version="2.2.0")
+
+@app.on_event("startup")
+async def startup_blocklist():
+    _refresh_blocklist(True)
+
+@app.get("/health")
+def health() -> dict:
+    try:
+        _refresh_blocklist(False)
+    except Exception:
+        pass
+    with _block_lock:
+        global_count = len(_block_global)
+        project_count = len(_block_projects)
+    return {
+        "ok": True,
+        "model_ack": DEFAULT_MODEL_ACK,
+        "model_snapback": DEFAULT_MODEL_SNAPBACK,
+        "model_followup": DEFAULT_MODEL_FOLLOWUP,
+        "blocklist_version": _block_version,
+        "blocklist_global_count": global_count,
+        "blocklist_projects": project_count,
+    }
+
+@app.post("/verbalytics", response_model=VerbalyticsOutput)
+async def verbalytics(payload: VerbalyticsInput = Body(...)):
+    start = time.time()
+
+    # Input blocklist (question + response)
+    input_hits = sorted(set(
+        find_blocked_phrases(payload.question, payload.project_id) +
+        find_blocked_phrases(payload.response, payload.project_id)
+    ))
+    if input_hits and INPUT_BLOCK_MODE == "reject":
+        raise HTTPException(status_code=422, detail={"message": "Input contains blocked phrases", "phrases": input_hits})
+
+    want_score = "score" in payload.tasks
+    want_ack = "ack" in payload.tasks
+    want_follow = "followup" in payload.tasks
+
+    # Always attempt snapback automatically (returns None if not needed)
+    snap_task = asyncio.create_task(generate_snapback(payload.question, payload.response, payload.project_id))
+    ack_task = asyncio.create_task(generate_ack(payload.question, payload.response, payload.project_id)) if want_ack else None
+    follow_task = asyncio.create_task(generate_followup(payload.question, payload.response, payload.project_id)) if want_follow else None
+
+    subs = None
+    score = ai_like = None
+    if want_score:
+        subs = score_engine.subscores(payload.question, payload.response)
+        score = score_engine.quality_score(payload.question, payload.response)
+        ai_like = score_engine.ai_likelihood(payload.response)
+
+    ack_res = follow_res = snap_res = None
+    try:
+        snap_res = await snap_task
+        if ack_task: ack_res = await ack_task
+        if follow_task: follow_res = await follow_task
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    latency_ms = int((time.time() - start) * 1000)
+    return VerbalyticsOutput(
+        subscores=subs,
+        score=score,
+        ai_likelihood=ai_like,
+        ack=ack_res if want_ack else None,
+        snapback=snap_res,
+        followup=follow_res if want_follow else None,
+        input_blocked_phrases=input_hits if input_hits else None,
+        latency_ms=latency_ms,
+    )
+
+@app.post("/verbalytics/stream")
+async def verbalytics_stream(payload: VerbalyticsInput = Body(...)):
+    async def event_gen():
+        start = time.time()
+
+        want_score = "score" in payload.tasks
+        want_ack = "ack" in payload.tasks
+        want_follow = "followup" in payload.tasks
+
+        # Input blocklist (flag-only in stream; enforce reject in sync endpoint)
+        input_hits = sorted(set(
+            find_blocked_phrases(payload.question, payload.project_id) +
+            find_blocked_phrases(payload.response, payload.project_id)
+        ))
+
+        if want_score:
+            subs = score_engine.subscores(payload.question, payload.response)
+            score = score_engine.quality_score(payload.question, payload.response)
+            ai_like = score_engine.ai_likelihood(payload.response)
+            yield JSONResponse(content={
+                "type": "score",
+                "subscores": subs,
+                "score": score,
+                "ai_likelihood": ai_like,
+                "input_blocked_phrases": input_hits or None
+            }).body + b"\n"
+
+        snap_task = asyncio.create_task(generate_snapback(payload.question, payload.response, payload.project_id))
+        ack_task = asyncio.create_task(generate_ack(payload.question, payload.response, payload.project_id)) if want_ack else None
+        follow_task = asyncio.create_task(generate_followup(payload.question, payload.response, payload.project_id)) if want_follow else None
+
+        snap = await snap_task
+        if snap:
+            yield JSONResponse(content={"type": "snapback", "snapback": snap}).body + b"\n"
+
+        if ack_task:
+            ack = await ack_task
+            yield JSONResponse(content={"type": "ack", "ack": ack}).body + b"\n"
+
+        if follow_task:
+            follow = await follow_task
+            yield JSONResponse(content={"type": "followup", "followup": follow}).body + b"\n"
+
+        latency_ms = int((time.time() - start) * 1000)
+        yield JSONResponse(content={"type": "done", "latency_ms": latency_ms}).body + b"\n"
+
+    return StreamingResponse(event_gen(), media_type="application/jsonl")
+
+# ---------------- Admin: Blocklist Introspection & Refresh ----------------
+@app.get("/admin/blocklist")
+async def admin_blocklist(project: Optional[str] = None):
+    phrases = get_block_phrases(project)
+    with _block_lock:
+        return {
+            "version": _block_version,
+            "global_count": len(_block_global),
+            "projects_map_count": len(_block_projects),
+            "project": _norm(project) if project else None,
+            "project_specific_count": len(_block_projects.get(_norm(project), set())) if project else None,
+            "merged_count": len(phrases),
+            "phrases": sorted(list(phrases)),
+        }
+
+@app.post("/admin/blocklist/refresh")
+async def admin_blocklist_refresh():
+    _refresh_blocklist(True)
+    with _block_lock:
+        return {
+            "ok": True,
+            "version": _block_version,
+            "global_count": len(_block_global),
+            "projects_map_count": len(_block_projects),
+        }
