@@ -161,10 +161,8 @@ class ScoreEngine:
         return [t.lower().strip(",.;:!?()[]{}\"'") for t in (s or "").split() if t.strip()]
 
     def _jaccard(self, a: set[str], b: set[str]) -> float:
-        if not a or not b:
-            return 0.0
-        inter = len(a & b)
-        union = len(a | b)
+        if not a or not b: return 0.0
+        inter = len(a & b); union = len(a | b)
         return inter / union if union else 0.0
 
     # subscores
@@ -180,30 +178,31 @@ class ScoreEngine:
         r_set  = set(r_toks)
         wc     = len(r_toks)
 
-        # Specificity: reasons, locators, unique mentions
+        # ---------- Specificity ----------
+        # rewards: reasons, emphasis, unique terms
         has_reason = any(k in r_set for k in {"because","since","so that","due"})
-        has_locators = any(k in r_set for k in {"when","where","which","that"})
+        has_emphasis = "especially" in r_set or "particularly" in r_set
         unique_terms = len([t for t in r_set if t not in q_toks and len(t) > 3])
-        spec_base = 60 * (1 - (2.71828 ** (-wc / 18)))  # diminishing returns
-        spec_bonus = 10 * has_reason + 6 * has_locators + min(24, unique_terms)
+        spec_base = 55 * (1 - (2.71828 ** (-wc / 16)))     # smoother ramp
+        spec_bonus = (12 if has_reason else 0) + (8 if has_emphasis else 0) + min(22, unique_terms)
         specificity = max(0, min(100, int(spec_base + spec_bonus)))
 
-        # Concreteness (updated): first-hand usage + context + feature/sensory + examples + light proper-noun
+        # ---------- Concreteness (first-hand + context + features + examples) ----------
         first_hand_markers = {
-            "i use", "i used", "i tried", "i've used", "i have used", "i bought", "we bought",
-            "my kids use", "my kid uses", "my children", "my family", "we use", "i saw", "i heard", "i've seen"
+            "i use","i used","i tried","i've used","i have used","i bought","we bought",
+            "my kids use","my kid uses","my children","my family","we use","i saw","i heard","i've seen"
         }
         usage_context = {
-            "at home", "at work", "for work", "on the train", "on the commute", "in the car",
-            "at night", "in the morning", "on weekends", "after school", "during football", "during ads",
-            "when cooking", "when cleaning", "while driving", "before bed"
+            "at home","at work","for work","on the train","on the commute","in the car",
+            "at night","in the morning","on weekends","after school","during football","during ads",
+            "when cooking","when cleaning","while driving","before bed"
         }
         feature_sensory = {
-            "logo","pack","packaging","design","music","jingle","voiceover","scene","actor","character",
+            "logo","pack","packaging","design","music","jingle","voiceover","scene","actor","character","dog",
             "taste","smell","texture","colour","color","price","offer","discount","durable","battery","speed",
             "instructions","interface","app","sound","volume","quality","resolution","camera","label","slogan"
         }
-        example_markers = {"for example", "such as", "like when", "like the time", "e.g."}
+        example_markers = {"for example","such as","like when","like the time","e.g.","especially","particularly"}
 
         rt = " " + " ".join(r_toks) + " "
         def has_any_phrase(hay: str, phrases: set[str]) -> bool:
@@ -213,34 +212,48 @@ class ScoreEngine:
         context_hit = has_any_phrase(rt, usage_context)
         example_hit = has_any_phrase(rt, example_markers)
         feature_hits = sum(1 for f in feature_sensory if f in r_set)
-        properish = sum(1 for w in (response.split()) if w[:1].isupper() and len(w) > 3)
-        length_credit = min(30, wc // 5)
+
+        # light proper-noun signal (brand/people names). 'I' doesn't count.
+        properish = sum(1 for w in (response.split()) if (w[:1].isupper() and len(w) > 3))
+
+        length_credit = min(28, wc // 5)
 
         conc_score = (
             (22 if first_hand else 0) +
             (14 if context_hit else 0) +
             (12 if example_hit else 0) +
-            min(28, feature_hits * 6) +
-            min(12, properish * 2) +
+            min(30, feature_hits * 7) +
+            min(10, properish * 2) +
             length_credit
         )
         concreteness = max(0, min(100, int(conc_score)))
 
-        # Relevance: lexical overlap; penalize off-topic markers
-        rel_overlap = 100 * self._jaccard(q_toks, r_set)
-        off_topic_markers = {"idk","no","none","whatever","random","unrelated"}
-        off = any(t in r_set for t in off_topic_markers)
-        relevance = max(0, min(100, int(rel_overlap - (25 if off else 0))))
+        # ---------- Relevance ----------
+        # Keep lexical overlap but add intent heuristics for opinion questions.
+        rel_overlap = 100 * self._jaccard(q_toks, r_set)  # often low for generic Qs like "what did you think..."
+        opinion_q = any(k in q_toks for k in {"think","opinion","feel","like","dislike","impression","favourite","favorite","rate"})
+        subjective_resp = any(k in r_set for k in {
+            "good","bad","great","love","hate","nice","funny","boring","memorable","confusing","clear","useful","annoying",
+            "enjoy","enjoyed","liked","disliked","amazing","awful","meh"
+        })
+        refers_to_ad = any(k in r_set for k in {"ad","advert","advertisement","commercial","spot","it","this"})
 
-        # Clarity: sentence length, filler/hedging
+        rel_heur = 0
+        if opinion_q and subjective_resp:
+            rel_heur += 65
+        if refers_to_ad:
+            rel_heur += 15
+        relevance = max(0, min(100, int(max(rel_overlap, rel_heur))))
+
+        # ---------- Clarity ----------
         sentences = [s for s in r.replace("!", ".").split(".") if s.strip()]
         avg_len = (sum(len(self._tokens(s)) for s in sentences)/len(sentences)) if sentences else wc
         too_long = avg_len > 28
         too_short = avg_len < 3
         fillers = {"like","basically","sort of","kind of","you know","stuff","things"}
         hedge = any(f in " ".join(r_toks) for f in fillers)
-        clarity_base = 80
-        clarity_pen = (15 if too_long else 0) + (15 if too_short else 0) + (10 if hedge else 0)
+        clarity_base = 82
+        clarity_pen = (14 if too_long else 0) + (14 if too_short else 0) + (8 if hedge else 0)
         clarity = max(0, min(100, int(clarity_base - clarity_pen)))
 
         return {
@@ -256,26 +269,35 @@ class ScoreEngine:
         return max(0, min(100, int(round(avg / 10) * 10)))
 
     def ai_likelihood(self, r: str) -> int:
-        if not r:
-            return 0
-        # lightweight heuristic for now
-        toks = self._tokens(r)
-        wc = len(toks)
-        base = 0 if wc < 15 else 10
+        if not r: return 0
+        toks = self._tokens(r); wc = len(toks)
+
+        # Small baseline for typical survey-length answers
+        base = 0
+        if wc >= 8: base = 5
+        if wc >= 20: base = 10
+
         templ = [
-            "as an ai", "as a language model", "overall,", "moreover,", "furthermore,",
-            "in summary", "in conclusion", "additionally,", "importantly,"
+            "as an ai","as a language model","overall,","moreover,","furthermore,",
+            "in summary","in conclusion","additionally,","importantly,"
         ]
         templ_hits = sum(1 for t in templ if t in r.lower())
-        verbose = 20 if wc > 180 else 0
-        very_verbose = 20 if wc > 350 else 0
+
         sents = [s.strip() for s in r.replace("!", ".").split(".") if s.strip()]
         lengths = [len(self._tokens(s)) for s in sents] or [wc]
         var = (max(lengths) - min(lengths))
-        low_var = 15 if (len(lengths) >= 3 and var <= 4) else 0
-        rep = 15 if len(set(toks)) / (wc or 1) < 0.45 else 0
-        score = base + templ_hits*20 + verbose + very_verbose + low_var + rep
+        low_var = 12 if (len(lengths) >= 3 and var <= 4) else 0
+
+        # lexical diversity
+        uniq_ratio = len(set(toks)) / (wc or 1)
+        rep = 14 if uniq_ratio < 0.48 else 0
+
+        verbose = 16 if wc > 180 else 0
+        very_verbose = 18 if wc > 350 else 0
+
+        score = base + templ_hits*22 + low_var + rep + verbose + very_verbose
         return int(max(0, min(100, score)))
+
 
 score_engine = ScoreEngine()
 
