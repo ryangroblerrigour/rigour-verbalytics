@@ -21,7 +21,6 @@ COPY . .
 
 # Optional: keep the sanity check, but make it less brittle
 # (do NOT fail the build for missing optional libs; fail only if main/app is missing)
-RUN python - <<'PY'
 import sys, importlib
 print("Python:", sys.version)
 for name in ("fastapi","pydantic","requests","openai"):
