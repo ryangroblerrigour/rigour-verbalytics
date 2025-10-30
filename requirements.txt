@@ -1,6 +1,7 @@
-fastapi>=0.110,<1.0
-uvicorn[standard]>=0.27
-pydantic>=2.6,<3
-openai>=1.0.0
+fastapi>=0.115
+pydantic>=2.7
+pydantic-settings>=2.4
+uvicorn[standard]>=0.30
 requests>=2.31
-python-dotenv
+openai>=1.44
+python-dotenv>=1.0
