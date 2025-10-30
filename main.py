@@ -408,7 +408,7 @@ async def generate_followup(
     model: str = DEFAULT_MODEL_FOLLOWUP,
     context: Optional[dict] = None
 ) -> str:
-    magic_mode = bool((context or {}).get("magic_mode")) or (project_id or "").lower() in {"magic", "magic_moments", "magic-moments"}
+magic_mode = True
 
     if magic_mode:
         has_what = _covers_what_happened(response)
