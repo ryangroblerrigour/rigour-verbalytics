@@ -327,7 +327,7 @@ async def _call_openai_chat(messages: list[dict], model: str, max_tokens: int) -
         resp = client.chat.completions.create(
             model=model,
             messages=messages,
-            max_completion_tokens=max_tokens
+            max_completion_tokens=max_tokens,
           stop=["\n"]
         )
         return resp.choices[0].message.content.strip()
