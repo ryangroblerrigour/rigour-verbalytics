@@ -179,15 +179,14 @@ class ScoreEngine:
         wc     = len(r_toks)
 
         # ---------- Specificity ----------
-        # rewards: reasons, emphasis, unique terms
         has_reason = any(k in r_set for k in {"because","since","so that","due"})
         has_emphasis = "especially" in r_set or "particularly" in r_set
         unique_terms = len([t for t in r_set if t not in q_toks and len(t) > 3])
-        spec_base = 55 * (1 - (2.71828 ** (-wc / 16)))     # smoother ramp
+        spec_base = 55 * (1 - (2.71828 ** (-wc / 16)))
         spec_bonus = (12 if has_reason else 0) + (8 if has_emphasis else 0) + min(22, unique_terms)
         specificity = max(0, min(100, int(spec_base + spec_bonus)))
 
-        # ---------- Concreteness (first-hand + context + features + examples) ----------
+        # ---------- Concreteness ----------
         first_hand_markers = {
             "i use","i used","i tried","i've used","i have used","i bought","we bought",
             "my kids use","my kid uses","my children","my family","we use","i saw","i heard","i've seen"
@@ -213,9 +212,7 @@ class ScoreEngine:
         example_hit = has_any_phrase(rt, example_markers)
         feature_hits = sum(1 for f in feature_sensory if f in r_set)
 
-        # light proper-noun signal (brand/people names). 'I' doesn't count.
         properish = sum(1 for w in (response.split()) if (w[:1].isupper() and len(w) > 3))
-
         length_credit = min(28, wc // 5)
 
         conc_score = (
@@ -229,8 +226,7 @@ class ScoreEngine:
         concreteness = max(0, min(100, int(conc_score)))
 
         # ---------- Relevance ----------
-        # Keep lexical overlap but add intent heuristics for opinion questions.
-        rel_overlap = 100 * self._jaccard(q_toks, r_set)  # often low for generic Qs like "what did you think..."
+        rel_overlap = 100 * self._jaccard(q_toks, r_set)
         opinion_q = any(k in q_toks for k in {"think","opinion","feel","like","dislike","impression","favourite","favorite","rate"})
         subjective_resp = any(k in r_set for k in {
             "good","bad","great","love","hate","nice","funny","boring","memorable","confusing","clear","useful","annoying",
@@ -272,7 +268,6 @@ class ScoreEngine:
         if not r: return 0
         toks = self._tokens(r); wc = len(toks)
 
-        # Small baseline for typical survey-length answers
         base = 0
         if wc >= 8: base = 5
         if wc >= 20: base = 10
@@ -288,7 +283,6 @@ class ScoreEngine:
         var = (max(lengths) - min(lengths))
         low_var = 12 if (len(lengths) >= 3 and var <= 4) else 0
 
-        # lexical diversity
         uniq_ratio = len(set(toks)) / (wc or 1)
         rep = 14 if uniq_ratio < 0.48 else 0
 
@@ -300,6 +294,30 @@ class ScoreEngine:
 
 
 score_engine = ScoreEngine()
+
+# ---------------------------------------------------------------------
+# Magic-moments coverage helpers (NEW)
+# ---------------------------------------------------------------------
+def _covers_what_happened(text: str) -> bool:
+    if not text: return False
+    t = " " + text.lower() + " "
+    action_markers = {
+        "i went","she gave","they helped","staff","associate","cashier","manager",
+        "showed me","found","brought","fixed","gift-wrapped","opened","closed",
+        "in aisle","at checkout","in store","queue","line","counter","fitting room",
+        "then","after","before","first","next","finally"
+    }
+    return any((" " + m + " ") in t for m in action_markers)
+
+def _covers_why_magic(text: str) -> bool:
+    if not text: return False
+    t = text.lower()
+    reason_markers = {
+        "because","so that","which meant","made me feel","felt","surprised","unexpected",
+        "above and beyond","special","appreciated","seen","understood","saved time",
+        "solved","fixed","resolved","exceeded","delighted"
+    }
+    return any(m in t for m in reason_markers)
 
 # ---------------------------------------------------------------------
 # Prompts
@@ -315,6 +333,15 @@ SYSTEM_FOLLOWUP = (
     "You are a professional market research moderator. Generate ONE open-ended follow-up question (max 22 words). "
     "It must be a single sentence, >=6 words, end with '?' and be neutral."
 )
+# NEW: focused follow-up for retail “magic moments”
+SYSTEM_FOLLOWUP_MAGIC = (
+    "You are a professional research moderator for retail 'magic moments'. "
+    "Ask ONE open-ended follow-up (6–22 words, single sentence, ends with '?'). "
+    "Target ONLY the missing piece:\n"
+    "• If the story lacks WHAT HAPPENED: ask for concrete sequence (who did what, where, when).\n"
+    "• If the story lacks WHY IT WAS MAGIC: ask for the reason it felt special (emotion, expectation vs reality, problem solved).\n"
+    "Do not ask about anything else. No pleasantries. No multiple questions."
+)
 
 # ---------------------------------------------------------------------
 # Generators (OpenAI)
@@ -328,7 +355,7 @@ async def _call_openai_chat(messages: list[dict], model: str, max_tokens: int) -
             model=model,
             messages=messages,
             max_completion_tokens=max_tokens,
-          stop=["\n"]
+            stop=["\n"]
         )
         return resp.choices[0].message.content.strip()
 
@@ -373,7 +400,60 @@ def _fallback_followup(q: str, r: str) -> str:
     if len(rlow.split()) <= 3: return "Could you share a bit more detail about that?"
     return "Can you give a specific example of what you mean?"
 
-async def generate_followup(question: str, response: str, project_id: Optional[str] = None, model: str = DEFAULT_MODEL_FOLLOWUP) -> str:
+# UPDATED: adds magic-mode branching and takes context
+async def generate_followup(
+    question: str,
+    response: str,
+    project_id: Optional[str] = None,
+    model: str = DEFAULT_MODEL_FOLLOWUP,
+    context: Optional[dict] = None
+) -> str:
+    magic_mode = bool((context or {}).get("magic_mode")) or (project_id or "").lower() in {"magic", "magic_moments", "magic-moments"}
+
+    if magic_mode:
+        has_what = _covers_what_happened(response)
+        has_why  = _covers_why_magic(response)
+
+        if not has_what and not has_why:
+            target = "WHAT HAPPENED"
+            instruction = "Ask specifically for the concrete sequence of events: who did what, where, and when."
+        elif not has_what:
+            target = "WHAT HAPPENED"
+            instruction = "Ask for the concrete sequence of events: who did what, where, and when."
+        elif not has_why:
+            target = "WHY IT WAS MAGIC"
+            instruction = "Ask for the reason it felt special—emotion, expectation vs reality, or problem solved."
+        else:
+            target = "WHY IT WAS MAGIC"
+            instruction = "Ask what exactly made the peak moment feel magical in customer terms."
+
+        messages = [
+            {"role": "system", "content": SYSTEM_FOLLOWUP_MAGIC},
+            {"role": "user", "content": (
+                f"Original question: {question.strip()}\n"
+                f"Respondent's answer: {response.strip()}\n"
+                f"Target: {target}. {instruction}\n"
+                "Return ONE follow-up question only."
+            )},
+        ]
+        text = await _call_openai_chat(messages, model=model, max_tokens=min(96, MAX_TOKENS))
+        t = (text or "").strip().replace("\n", " ")
+        if not t or t == "?" or len(t.split()) < 6:
+            t = ("Could you walk me through exactly what happened, step by step?"
+                 if target == "WHAT HAPPENED"
+                 else "What made that moment feel special compared with your usual expectations?")
+        if not t.endswith("?"):
+            t = t.rstrip(" .!") + "?"
+        if contains_blocked_phrase(t, project_id):
+            avoid = ", ".join(sorted(list(get_block_phrases(project_id))))
+            messages[0]["content"] = SYSTEM_FOLLOWUP_MAGIC + (f" Avoid: {avoid}" if avoid else "")
+            text2 = await _call_openai_chat(messages, model=model, max_tokens=min(96, MAX_TOKENS))
+            t2 = (text2 or "").strip().replace("\n", " ")
+            if t2 and t2 != "?" and len(t2.split()) >= 6 and t2.endswith("?") and not contains_blocked_phrase(t2, project_id):
+                t = t2
+        return t
+
+    # --- default path (non-magic projects) ---
     messages = [
         {"role": "system", "content": SYSTEM_FOLLOWUP},
         {"role": "user", "content": f"Original question: {question.strip()} Respondent's answer: {response.strip()} Write ONE follow-up question only."},
@@ -443,7 +523,10 @@ async def verbalytics(payload: VerbalyticsInput = Body(...)):
     # Always attempt snapback automatically (returns None if not needed)
     snap_task = asyncio.create_task(generate_snapback(payload.question, payload.response, payload.project_id))
     ack_task = asyncio.create_task(generate_ack(payload.question, payload.response, payload.project_id)) if want_ack else None
-    follow_task = asyncio.create_task(generate_followup(payload.question, payload.response, payload.project_id)) if want_follow else None
+    # UPDATED: pass context
+    follow_task = asyncio.create_task(
+        generate_followup(payload.question, payload.response, payload.project_id, context=payload.context)
+    ) if want_follow else None
 
     subs = None
     score = ai_like = None
@@ -503,7 +586,10 @@ async def verbalytics_stream(payload: VerbalyticsInput = Body(...)):
 
         snap_task = asyncio.create_task(generate_snapback(payload.question, payload.response, payload.project_id))
         ack_task = asyncio.create_task(generate_ack(payload.question, payload.response, payload.project_id)) if want_ack else None
-        follow_task = asyncio.create_task(generate_followup(payload.question, payload.response, payload.project_id)) if want_follow else None
+        # UPDATED: pass context
+        follow_task = asyncio.create_task(
+            generate_followup(payload.question, payload.response, payload.project_id, context=payload.context)
+        ) if want_follow else None
 
         snap = await snap_task
         if snap:
