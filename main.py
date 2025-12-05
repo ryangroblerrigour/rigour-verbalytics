@@ -273,8 +273,8 @@ class ScoreEngine:
         if wc >= 20: base = 10
 
         templ = [
-            "as an ai","as a language model","overall,","moreover,","furthermore,",
-            "in summary","in conclusion","additionally,","importantly,"
+            "as an ai","as a language model","overall,","moreover","furthermore",
+            "in summary","in conclusion","additionally","importantly"
         ]
         templ_hits = sum(1 for t in templ if t in r.lower())
 
@@ -296,30 +296,6 @@ class ScoreEngine:
 score_engine = ScoreEngine()
 
 # ---------------------------------------------------------------------
-# Magic-moments coverage helpers (NEW)
-# ---------------------------------------------------------------------
-def _covers_what_happened(text: str) -> bool:
-    if not text: return False
-    t = " " + text.lower() + " "
-    action_markers = {
-        "i went","she gave","they helped","staff","associate","cashier","manager",
-        "showed me","found","brought","fixed","gift-wrapped","opened","closed",
-        "in aisle","at checkout","in store","queue","line","counter","fitting room",
-        "then","after","before","first","next","finally"
-    }
-    return any((" " + m + " ") in t for m in action_markers)
-
-def _covers_why_magic(text: str) -> bool:
-    if not text: return False
-    t = text.lower()
-    reason_markers = {
-        "because","so that","which meant","made me feel","felt","surprised","unexpected",
-        "above and beyond","special","appreciated","seen","understood","saved time",
-        "solved","fixed","resolved","exceeded","delighted"
-    }
-    return any(m in t for m in reason_markers)
-
-# ---------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------
 SYSTEM_ACK = (
@@ -332,15 +308,6 @@ SYSTEM_SNAPBACK = (
 SYSTEM_FOLLOWUP = (
     "You are a professional market research moderator. Generate ONE open-ended follow-up question (max 22 words). "
     "It must be a single sentence, >=6 words, end with '?' and be neutral."
-)
-# NEW: focused follow-up for retail “magic moments”
-SYSTEM_FOLLOWUP_MAGIC = (
-    "You are a professional research moderator for retail 'magic moments'. "
-    "Ask ONE open-ended follow-up (6–22 words, single sentence, ends with '?'). "
-    "Target ONLY the missing piece:\n"
-    "• If the story lacks WHAT HAPPENED: ask for concrete sequence (who did what, where, when).\n"
-    "• If the story lacks WHY IT WAS MAGIC: ask for the reason it felt special (emotion, expectation vs reality, problem solved).\n"
-    "Do not ask about anything else. No pleasantries. No multiple questions."
 )
 
 # ---------------------------------------------------------------------
@@ -394,69 +361,34 @@ async def generate_snapback(q: str, r: str, project_id: Optional[str] = None, mo
 
 def _fallback_followup(q: str, r: str) -> str:
     rlow = (r or "").lower()
-    if any(k in rlow for k in ["funny","humor","humour","memorable","like","love","enjoy"]): return "What specifically made it stand out for you?"
-    if any(k in rlow for k in ["confusing","unclear","didn't get","dont get","don't get","did not get"]): return "Which part felt confusing, and why?"
-    if any(k in rlow for k in ["boring","slow","long"]): return "What made it feel boring, and how could it be improved?"
-    if len(rlow.split()) <= 3: return "Could you share a bit more detail about that?"
+    if any(k in rlow for k in ["funny","humor","humour","memorable","like","love","enjoy"]):
+        return "What specifically made it stand out for you?"
+    if any(k in rlow for k in ["confusing","unclear","didn't get","dont get","don't get","did not get"]):
+        return "Which part felt confusing, and why?"
+    if any(k in rlow for k in ["boring","slow","long"]):
+        return "What made it feel boring, and how could it be improved?"
+    if len(rlow.split()) <= 3:
+        return "Could you share a bit more detail about that?"
     return "Can you give a specific example of what you mean?"
 
-# UPDATED: adds magic-mode branching and takes context
+# Generic follow-up (no magic moments logic)
 async def generate_followup(
     question: str,
     response: str,
     project_id: Optional[str] = None,
     model: str = DEFAULT_MODEL_FOLLOWUP,
-    context: Optional[dict] = None
+    context: Optional[dict] = None,  # kept for compatibility, not used
 ) -> str:
-magic_mode = True
-
-    if magic_mode:
-        has_what = _covers_what_happened(response)
-        has_why  = _covers_why_magic(response)
-
-        if not has_what and not has_why:
-            target = "WHAT HAPPENED"
-            instruction = "Ask specifically for the concrete sequence of events: who did what, where, and when."
-        elif not has_what:
-            target = "WHAT HAPPENED"
-            instruction = "Ask for the concrete sequence of events: who did what, where, and when."
-        elif not has_why:
-            target = "WHY IT WAS MAGIC"
-            instruction = "Ask for the reason it felt special—emotion, expectation vs reality, or problem solved."
-        else:
-            target = "WHY IT WAS MAGIC"
-            instruction = "Ask what exactly made the peak moment feel magical in customer terms."
-
-        messages = [
-            {"role": "system", "content": SYSTEM_FOLLOWUP_MAGIC},
-            {"role": "user", "content": (
-                f"Original question: {question.strip()}\n"
-                f"Respondent's answer: {response.strip()}\n"
-                f"Target: {target}. {instruction}\n"
-                "Return ONE follow-up question only."
-            )},
-        ]
-        text = await _call_openai_chat(messages, model=model, max_tokens=min(96, MAX_TOKENS))
-        t = (text or "").strip().replace("\n", " ")
-        if not t or t == "?" or len(t.split()) < 6:
-            t = ("Could you walk me through exactly what happened, step by step?"
-                 if target == "WHAT HAPPENED"
-                 else "What made that moment feel special compared with your usual expectations?")
-        if not t.endswith("?"):
-            t = t.rstrip(" .!") + "?"
-        if contains_blocked_phrase(t, project_id):
-            avoid = ", ".join(sorted(list(get_block_phrases(project_id))))
-            messages[0]["content"] = SYSTEM_FOLLOWUP_MAGIC + (f" Avoid: {avoid}" if avoid else "")
-            text2 = await _call_openai_chat(messages, model=model, max_tokens=min(96, MAX_TOKENS))
-            t2 = (text2 or "").strip().replace("\n", " ")
-            if t2 and t2 != "?" and len(t2.split()) >= 6 and t2.endswith("?") and not contains_blocked_phrase(t2, project_id):
-                t = t2
-        return t
-
-    # --- default path (non-magic projects) ---
     messages = [
         {"role": "system", "content": SYSTEM_FOLLOWUP},
-        {"role": "user", "content": f"Original question: {question.strip()} Respondent's answer: {response.strip()} Write ONE follow-up question only."},
+        {
+            "role": "user",
+            "content": (
+                f"Original question: {question.strip()} "
+                f"Respondent's answer: {response.strip()} "
+                "Write ONE follow-up question only."
+            ),
+        },
     ]
     text = await _call_openai_chat(messages, model=model, max_tokens=min(96, MAX_TOKENS))
     t = (text or "").strip().replace("\n", " ")
@@ -468,7 +400,14 @@ magic_mode = True
         avoid = ", ".join(sorted(list(get_block_phrases(project_id))))
         messages2 = [
             {"role": "system", "content": SYSTEM_FOLLOWUP + (" Avoid any of these terms: " + avoid if avoid else "")},
-            {"role": "user", "content": f"Original question: {question.strip()} Respondent's answer: {response.strip()} Write ONE follow-up question only."},
+            {
+                "role": "user",
+                "content": (
+                    f"Original question: {question.strip()} "
+                    f"Respondent's answer: {response.strip()} "
+                    "Write ONE follow-up question only."
+                ),
+            },
         ]
         text2 = await _call_openai_chat(messages2, model=model, max_tokens=min(96, MAX_TOKENS))
         t2 = (text2 or "").strip().replace("\n", " ")
@@ -477,7 +416,7 @@ magic_mode = True
     return t
 
 # ---------------------------------------------------------------------
-# FastAPI app (TOP-LEVEL — this fixes the "app not found")
+# FastAPI app
 # ---------------------------------------------------------------------
 app = FastAPI(title="Verbalytics 2.2 API", version="2.2.0")
 
@@ -523,7 +462,6 @@ async def verbalytics(payload: VerbalyticsInput = Body(...)):
     # Always attempt snapback automatically (returns None if not needed)
     snap_task = asyncio.create_task(generate_snapback(payload.question, payload.response, payload.project_id))
     ack_task = asyncio.create_task(generate_ack(payload.question, payload.response, payload.project_id)) if want_ack else None
-    # UPDATED: pass context
     follow_task = asyncio.create_task(
         generate_followup(payload.question, payload.response, payload.project_id, context=payload.context)
     ) if want_follow else None
@@ -586,7 +524,6 @@ async def verbalytics_stream(payload: VerbalyticsInput = Body(...)):
 
         snap_task = asyncio.create_task(generate_snapback(payload.question, payload.response, payload.project_id))
         ack_task = asyncio.create_task(generate_ack(payload.question, payload.response, payload.project_id)) if want_ack else None
-        # UPDATED: pass context
         follow_task = asyncio.create_task(
             generate_followup(payload.question, payload.response, payload.project_id, context=payload.context)
         ) if want_follow else None
