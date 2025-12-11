@@ -21,7 +21,7 @@ Run locally:
 """
 from __future__ import annotations
 
-import os, math, time, asyncio, csv, requests
+import os, time, asyncio, csv, requests
 from typing import Optional, Literal, Dict, Any
 from time import monotonic
 from threading import RLock
@@ -48,6 +48,30 @@ BLOCKLIST_CSV_URL = os.getenv("GOOGLE_BLOCKLIST_SHEET", "")
 BLOCKLIST_REFRESH_SECONDS = int(os.getenv("VERBALYTICS_BLOCKLIST_REFRESH_SECONDS", "300"))
 INPUT_BLOCK_MODE = os.getenv("VERBALYTICS_BLOCK_INPUT_MODE", "flag").lower()  # off | flag | reject
 
+# Supported locales for ack/followup
+SUPPORTED_LOCALES: Dict[str, str] = {
+    "en": "English",
+    "fr": "French",
+    "de": "German",
+    "it": "Italian",
+    "es": "Spanish",
+}
+
+
+def normalise_locale(loc: Optional[str]) -> str:
+    """
+    Normalise locale codes:
+    - Accepts 'en', 'en-GB', 'de-DE', etc.
+    - Returns one of: 'en','fr','de','it','es'
+    - Defaults to 'en'
+    """
+    loc = (loc or "en").lower()
+    for code in SUPPORTED_LOCALES.keys():
+        if loc.startswith(code):
+            return code
+    return "en"
+
+
 # ---------------------------------------------------------------------
 # OpenAI Client
 # ---------------------------------------------------------------------
@@ -69,11 +93,11 @@ def get_client() -> OpenAI:
 class VerbalyticsInput(BaseModel):
     question: str
     response: str
-    # NEW: add "check" as an allowed task, but default stays the same
+    # now includes "check" as a task
     tasks: list[Literal["score", "ack", "followup", "check"]] = Field(
         default_factory=lambda: ["score", "ack", "followup"]
     )
-    locale: Optional[str] = "en"
+    locale: Optional[str] = "en"  # en, fr, de, it, es...
     context: Optional[Dict[str, Any]] = None
     project_id: Optional[str] = None
 
@@ -414,6 +438,7 @@ SYSTEM_FOLLOWUP = (
     "It must be a single sentence, >=6 words, end with '?' and be neutral."
 )
 
+
 # ---------------------------------------------------------------------
 # Generators (OpenAI)
 # ---------------------------------------------------------------------
@@ -436,23 +461,37 @@ async def _call_openai_chat(messages: list[dict], model: str, max_tokens: int) -
         raise HTTPException(status_code=504, detail=f"Model '{model}' timed out")
 
 
-async def generate_ack(q: str, r: str, project_id: Optional[str] = None, model: str = DEFAULT_MODEL_ACK) -> str:
+async def generate_ack(
+    q: str,
+    r: str,
+    project_id: Optional[str] = None,
+    model: str = DEFAULT_MODEL_ACK,
+    locale: Optional[str] = None,
+) -> str:
+    loc = normalise_locale(locale)
+    lang_name = SUPPORTED_LOCALES.get(loc, "English")
+    system = SYSTEM_ACK + f" Always respond in {lang_name} ({loc}) only."
     messages = [
-        {"role": "system", "content": SYSTEM_ACK},
+        {"role": "system", "content": system},
         {"role": "user", "content": f"Q: {q.strip()} A: {r.strip()} Return only acknowledgement."},
     ]
     text = await _call_openai_chat(messages, model, max_tokens=min(24, MAX_TOKENS))
     ack = text.split("\n")[0][:120]
     if contains_blocked_phrase(ack, project_id):
         avoid = ", ".join(sorted(get_block_phrases(project_id)))
-        messages[0]["content"] += f" Avoid: {avoid}"
+        messages[0]["content"] = system + (f" Avoid: {avoid}" if avoid else "")
         ack2 = await _call_openai_chat(messages, model, max_tokens=min(24, MAX_TOKENS))
         if not contains_blocked_phrase(ack2, project_id):
             return ack2
     return ack
 
 
-async def generate_snapback(q: str, r: str, project_id: Optional[str] = None, model: str = DEFAULT_MODEL_SNAPBACK) -> Optional[str]:
+async def generate_snapback(
+    q: str,
+    r: str,
+    project_id: Optional[str] = None,
+    model: str = DEFAULT_MODEL_SNAPBACK,
+) -> Optional[str]:
     # Only trigger if poor/irrelevant response (very short or empty)
     if not r or len(r.split()) <= 3:
         messages = [
@@ -482,16 +521,19 @@ def _fallback_followup(q: str, r: str) -> str:
     return "Can you give a specific example of what you mean?"
 
 
-# Generic follow-up (no magic moments logic)
 async def generate_followup(
     question: str,
     response: str,
     project_id: Optional[str] = None,
     model: str = DEFAULT_MODEL_FOLLOWUP,
-    context: Optional[dict] = None,  # kept for compatibility, not used
+    context: Optional[dict] = None,
+    locale: Optional[str] = None,
 ) -> str:
+    loc = normalise_locale(locale)
+    lang_name = SUPPORTED_LOCALES.get(loc, "English")
+    system = SYSTEM_FOLLOWUP + f" Always respond in {lang_name} ({loc}) only."
     messages = [
-        {"role": "system", "content": SYSTEM_FOLLOWUP},
+        {"role": "system", "content": system},
         {
             "role": "user",
             "content": (
@@ -510,7 +552,10 @@ async def generate_followup(
     if contains_blocked_phrase(t, project_id):
         avoid = ", ".join(sorted(list(get_block_phrases(project_id))))
         messages2 = [
-            {"role": "system", "content": SYSTEM_FOLLOWUP + (" Avoid any of these terms: " + avoid if avoid else "")},
+            {
+                "role": "system",
+                "content": system + (" Avoid any of these terms: " + avoid if avoid else ""),
+            },
             {
                 "role": "user",
                 "content": (
@@ -563,13 +608,11 @@ async def verbalytics(payload: VerbalyticsInput = Body(...)):
     start = time.time()
 
     # ---------- NEW: lightweight "check" mode (no models, just answer vs library) ----------
-    # If the client only asks for "check" (and nothing else), we avoid all model calls.
     only_check = (
         "check" in payload.tasks
         and not any(t in payload.tasks for t in ["score", "ack", "followup"])
     )
     if only_check:
-        # For this fast path we ONLY look at the respondent's answer vs the library.
         hits = sorted(set(find_blocked_phrases(payload.response, payload.project_id)))
         latency_ms = int((time.time() - start) * 1000)
         return VerbalyticsOutput(
@@ -583,8 +626,7 @@ async def verbalytics(payload: VerbalyticsInput = Body(...)):
             latency_ms=latency_ms,
         )
 
-    # ---------- existing behaviour for score/ack/followup (UNCHANGED) ----------
-    # Input blocklist (question + response)
+    # ---------- existing behaviour for score/ack/followup ----------
     input_hits = sorted(
         set(
             find_blocked_phrases(payload.question, payload.project_id)
@@ -601,13 +643,17 @@ async def verbalytics(payload: VerbalyticsInput = Body(...)):
     want_ack = "ack" in payload.tasks
     want_follow = "followup" in payload.tasks
 
-    # Always attempt snapback automatically (returns None if not needed)
     snap_task = asyncio.create_task(
         generate_snapback(payload.question, payload.response, payload.project_id)
     )
     ack_task = (
         asyncio.create_task(
-            generate_ack(payload.question, payload.response, payload.project_id)
+            generate_ack(
+                payload.question,
+                payload.response,
+                payload.project_id,
+                locale=payload.locale,
+            )
         )
         if want_ack
         else None
@@ -619,6 +665,7 @@ async def verbalytics(payload: VerbalyticsInput = Body(...)):
                 payload.response,
                 payload.project_id,
                 context=payload.context,
+                locale=payload.locale,
             )
         )
         if want_follow
@@ -696,7 +743,12 @@ async def verbalytics_stream(payload: VerbalyticsInput = Body(...)):
         )
         ack_task = (
             asyncio.create_task(
-                generate_ack(payload.question, payload.response, payload.project_id)
+                generate_ack(
+                    payload.question,
+                    payload.response,
+                    payload.project_id,
+                    locale=payload.locale,
+                )
             )
             if want_ack
             else None
@@ -708,6 +760,7 @@ async def verbalytics_stream(payload: VerbalyticsInput = Body(...)):
                     payload.response,
                     payload.project_id,
                     context=payload.context,
+                    locale=payload.locale,
                 )
             )
             if want_follow
