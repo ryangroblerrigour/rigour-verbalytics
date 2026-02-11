@@ -78,6 +78,8 @@ def _locale_instruction(locale: Optional[str]) -> str:
         return "Respond in Turkish only."
     if loc.startswith("zh"):
         return "Respond in Chinese only."
+    if loc.startswith("pl"):
+        return "Respond in Polish only."
     return "Respond in English only."
 
 
