@@ -59,7 +59,7 @@ INPUT_BLOCK_MODE = os.getenv("VERBALYTICS_BLOCK_INPUT_MODE", "flag").lower()  # 
 def _locale_instruction(locale: Optional[str]) -> str:
     """
     We only need a simple, predictable behaviour: output language matches locale.
-    Accepts: en, fr, de, it, es, tr, zh, ar (also accepts regional variants like ar-SA).
+    Accepts: en, fr, de, it, es, tr, zh, ar, ko (also accepts regional variants like ar-SA).
     Unknown -> English.
     """
     loc = (locale or "en").strip().lower().replace("_", "-")
@@ -80,6 +80,8 @@ def _locale_instruction(locale: Optional[str]) -> str:
         return "Respond in Chinese only."
     if loc.startswith("pl"):
         return "Respond in Polish only."
+      if loc.startswith(“ko”):
+        return "Respond in Korean only."
     return "Respond in English only."
 
 
