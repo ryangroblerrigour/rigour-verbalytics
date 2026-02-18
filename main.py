@@ -80,7 +80,7 @@ def _locale_instruction(locale: Optional[str]) -> str:
         return "Respond in Chinese only."
     if loc.startswith("pl"):
         return "Respond in Polish only."
-    if loc.startswith(“ko”):
+    if loc.startswith("ko"):
         return "Respond in Korean only."
     return "Respond in English only."
 
