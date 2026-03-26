@@ -826,10 +826,11 @@ def deepdive(req: DeepDiveRequest):
     session["turn_count"] += 1
 
     return {
-        "context_label": context_label,
-        "deepdive": {
-            "next_question": question,
-            "probe_type": probe_type,
-            "should_continue": True
-        }
+    "context_label": context_label,
+    "deepdive": {
+        "question_code": question_code,
+        "next_question": question,
+        "probe_type": probe_type,
+        "should_continue": True
     }
+}
