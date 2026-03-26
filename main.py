@@ -667,5 +667,169 @@ async def admin_blocklist_refresh():
             "ok": True,
             "version": _block_version,
             "global_count": len(_block_global),
-            "projects_map_count": len(_block_projects),
+            "projects_map_count": len(_block_projects)
+        
         }
+# =========================================================
+# DEEPDIVE MODULE (NEW - SAFE ADDITION)
+# =========================================================
+
+SESSIONS = {}
+
+class DeepDiveRequest(BaseModel):
+    project_id: str
+    respondent_id: str
+    question_id: str
+    response: str
+    prior_answers: Optional[Dict[str, float]] = None
+
+
+def get_session_key(project_id, respondent_id, question_id):
+    return f"{project_id}_{respondent_id}_{question_id}"
+
+
+def load_question_config(project_id, question_id):
+    path = f"configs/projects/{project_id}/{question_id}.json"
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def evaluate_context_rules(config, prior_answers):
+    for rule in config["context_rules"]:
+        cond = rule["condition"]
+
+        if cond["type"] == "average_score":
+            values = [prior_answers.get(q) for q in cond["questions"]]
+            if None in values:
+                continue
+
+            avg = sum(values) / len(values)
+
+            if cond["operator"] == "<=" and avg <= cond["value"]:
+                return rule
+            if cond["operator"] == ">=" and avg >= cond["value"]:
+                return rule
+
+        elif cond["type"] == "fallback":
+            return rule
+
+    return {
+        "label": "neutral",
+        "interview_focus": "Explore the response in depth."
+    }
+
+
+def evaluate_response_simple(response, history):
+    r = response.lower().strip()
+
+    return {
+        "is_dont_know": r in ["dont know", "don't know", "not sure", "idk"],
+        "is_vague": len(r.split()) < 5,
+        "has_reason": "because" in r,
+        "has_example": "when" in r,
+        "is_repetitive": any(h["text"].lower() == r for h in history if h["role"] == "user")
+    }
+
+
+def select_probe_type(evaluation):
+    if evaluation["is_vague"]:
+        return "clarification"
+    if evaluation["has_reason"] and not evaluation["has_example"]:
+        return "concretising"
+    if not evaluation["has_reason"]:
+        return "laddering"
+    return "expansion"
+
+
+def generate_question(probe_type):
+    if probe_type == "clarification":
+        return "What do you mean by that?"
+    if probe_type == "concretising":
+        return "Can you give an example?"
+    if probe_type == "laddering":
+        return "Why is that?"
+    return "What else?"
+
+
+@app.post("/deepdive")
+def deepdive(req: DeepDiveRequest):
+
+    session_key = get_session_key(
+        req.project_id,
+        req.respondent_id,
+        req.question_id
+    )
+
+    if session_key not in SESSIONS:
+        SESSIONS[session_key] = {
+            "history": [],
+            "turn_count": 0,
+            "dont_know_streak": 0
+        }
+
+    session = SESSIONS[session_key]
+
+    # Store response
+    session["history"].append({"role": "user", "text": req.response})
+
+    # Load config
+    try:
+        config = load_question_config(req.project_id, req.question_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Question config not found")
+
+    # Context logic
+    context_rule = evaluate_context_rules(
+        config,
+        req.prior_answers or {}
+    )
+
+    context_label = context_rule["label"]
+    interview_focus = context_rule.get("interview_focus", "")
+
+    # Evaluate response
+    evaluation = evaluate_response_simple(req.response, session["history"])
+
+    # Update streak
+    if evaluation["is_dont_know"]:
+        session["dont_know_streak"] += 1
+    else:
+        session["dont_know_streak"] = 0
+
+    # Termination rules
+    if session["dont_know_streak"] >= 3:
+        return {
+            "context_label": context_label,
+            "deepdive": {
+                "should_continue": False,
+                "stop_reason": "low_engagement"
+            }
+        }
+
+    if session["turn_count"] >= 4:
+        return {
+            "context_label": context_label,
+            "deepdive": {
+                "should_continue": False,
+                "stop_reason": "max_turns"
+            }
+        }
+
+    # Select probe
+    probe_type = select_probe_type(evaluation)
+
+    # Generate question
+    question = generate_question(probe_type)
+
+    # Store assistant turn
+    session["history"].append({"role": "assistant", "text": question})
+    session["turn_count"] += 1
+
+    return {
+        "context_label": context_label,
+        "deepdive": {
+            "next_question": question,
+            "probe_type": probe_type,
+            "should_continue": True
+        }
+    }
