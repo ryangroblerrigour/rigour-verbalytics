@@ -1,0 +1,33 @@
+{
+  "project_id": "proj_001",
+  "question_id": "Q10",
+  "context_rules": [
+    {
+      "label": "negative",
+      "condition": {
+        "type": "average_score",
+        "questions": ["Q7_1", "Q7_2", "Q7_3"],
+        "operator": "<=",
+        "value": 4
+      },
+      "interview_focus": "Explore dissatisfaction, frustrations, and what is not working."
+    },
+    {
+      "label": "positive",
+      "condition": {
+        "type": "average_score",
+        "questions": ["Q7_1", "Q7_2", "Q7_3"],
+        "operator": ">=",
+        "value": 8
+      },
+      "interview_focus": "Explore what works well and what stands out positively."
+    },
+    {
+      "label": "neutral",
+      "condition": {
+        "type": "fallback"
+      },
+      "interview_focus": "Explore the response in depth."
+    }
+  ]
+}
