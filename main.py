@@ -688,8 +688,21 @@ def get_session_key(project_id, respondent_id, question_id):
     return f"{project_id}_{respondent_id}_{question_id}"
 
 
+import os
+
 def load_question_config(project_id, question_id):
-    path = f"configs/projects/{project_id}/{question_id}.json"
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(
+        base_dir,
+        "configs",
+        "projects",
+        project_id,
+        f"{question_id}.json"
+    )
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Config not found at {path}")
+
     with open(path, "r") as f:
         return json.load(f)
 
