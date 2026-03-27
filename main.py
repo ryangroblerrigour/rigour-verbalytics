@@ -751,21 +751,31 @@ def evaluate_response_simple(response, history):
 def detect_sentiment(response: str):
     r = (response or "").lower()
 
+    # Strong patterns first (phrases)
+    if "don't like" in r or "dont like" in r:
+        return "negative"
+
+    if "do not like" in r:
+        return "negative"
+
+    if "like it" in r or "i like" in r:
+        return "positive"
+
+    # Keyword fallback
     positive = ["like", "love", "good", "clear", "appealing", "strong", "great", "nice"]
-    negative = ["dislike", "confusing", "unclear", "bad", "boring", "weak"]
+    negative = ["dislike", "confusing", "unclear", "bad", "boring", "weak", "hate"]
 
     pos = any(w in r for w in positive)
     neg = any(w in r for w in negative)
 
     if pos and neg:
         return "mixed"
-    if pos:
-        return "positive"
     if neg:
         return "negative"
+    if pos:
+        return "positive"
 
     return "neutral"
-
 
 # ----------------------------
 # Consistency logic (NEW)
