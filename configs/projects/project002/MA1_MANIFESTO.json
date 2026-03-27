@@ -4,7 +4,7 @@
 
   "main_question": "What made you give it that score?",
 
-  "objective": "Understand why the No7 design does or does not resonate, identifying specific elements that drive appeal or disengagement.",
+  "objective": "Understand why the No7 design does or does not resonate, identifying specific elements that drive appeal or disengagement. If it does resonate with them we want to understand how that impacts them and if it doesn't resonate with them we want to understand why it doesnt, how it impacts them and what changes could be made to make it resonate with them",
 
   "probe_goal": "Extract clear, specific feedback on what is appealing and unappealing in the manifesto, and ensure alignment between score and reasoning.",
 
@@ -38,7 +38,7 @@
       "interview_focus": "Understand what is unappealing, unclear, or not resonating, and identify specific weaknesses in the manifesto.",
       "consistency_rules": {
         "expected_sentiment": "negative",
-        "if_mismatch": "Respondent gives positive feedback but low score → probe contradiction"
+        "enforce_mismatch": true
       }
     },
     {
@@ -53,7 +53,7 @@
       "interview_focus": "Explore both what works and what does not work, identifying trade-offs and mixed perceptions.",
       "consistency_rules": {
         "expected_sentiment": "mixed",
-        "if_missing_side": "If only positive or only negative is mentioned → probe the missing side"
+        "enforce_balance": true
       }
     },
     {
@@ -68,7 +68,7 @@
       "interview_focus": "Understand what is resonating strongly and which elements drive appeal and connection.",
       "consistency_rules": {
         "expected_sentiment": "positive",
-        "if_mismatch": "Respondent gives negative feedback but high score → probe contradiction"
+        "enforce_mismatch": true
       }
     },
     {
