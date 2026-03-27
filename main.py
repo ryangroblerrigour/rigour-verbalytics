@@ -671,7 +671,7 @@ async def admin_blocklist_refresh():
         
         }
 # =========================================================
-# DEEPDIVE MODULE (NEW - SAFE ADDITION)
+# DEEPDIVE MODULE (UPGRADED)
 # =========================================================
 
 SESSIONS = {}
@@ -687,8 +687,6 @@ class DeepDiveRequest(BaseModel):
 def get_session_key(project_id, respondent_id, question_id):
     return f"{project_id}_{respondent_id}_{question_id}"
 
-
-import os
 
 def load_question_config(project_id, question_id):
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -708,22 +706,27 @@ def load_question_config(project_id, question_id):
 
 
 def evaluate_context_rules(config, prior_answers):
-    for rule in config["context_rules"]:
-        cond = rule["condition"]
+    for rule in config.get("context_rules", []):
+        cond = rule.get("condition", {})
+        cond_type = cond.get("type")
 
-        if cond["type"] == "average_score":
-            values = [prior_answers.get(q) for q in cond["questions"]]
-            if None in values:
+        if cond_type == "average_score":
+            questions = cond.get("questions", [])
+            values = [prior_answers.get(q) for q in questions]
+
+            if None in values or not values:
                 continue
 
             avg = sum(values) / len(values)
+            operator = cond.get("operator")
+            threshold = cond.get("value")
 
-            if cond["operator"] == "<=" and avg <= cond["value"]:
+            if operator == "<=" and avg <= threshold:
                 return rule
-            if cond["operator"] == ">=" and avg >= cond["value"]:
+            if operator == ">=" and avg >= threshold:
                 return rule
 
-        elif cond["type"] == "fallback":
+        elif cond_type == "fallback":
             return rule
 
     return {
@@ -732,6 +735,9 @@ def evaluate_context_rules(config, prior_answers):
     }
 
 
+# ----------------------------
+# Improved evaluator
+# ----------------------------
 def evaluate_response_simple(response, history):
     r = response.lower().strip()
 
@@ -739,33 +745,101 @@ def evaluate_response_simple(response, history):
         "is_dont_know": r in ["dont know", "don't know", "not sure", "idk"],
         "is_vague": len(r.split()) < 5,
         "has_reason": "because" in r,
-        "has_example": "when" in r,
+        "has_example": any(x in r for x in ["when", "for example", "like when"]),
+        "is_specific": len(r.split()) > 6,
         "is_repetitive": any(h["text"].lower() == r for h in history if h["role"] == "user")
     }
 
 
+# ----------------------------
+# Improved probe selection
+# ----------------------------
 def select_probe_type(evaluation):
+
     if evaluation["is_vague"]:
         return "clarification"
+
+    if evaluation["has_example"] and not evaluation["has_reason"]:
+        return "impact"
+
     if evaluation["has_reason"] and not evaluation["has_example"]:
         return "concretising"
-    if not evaluation["has_reason"]:
-        return "laddering"
-    return "expansion"
+
+    if evaluation["has_reason"] and evaluation["has_example"]:
+        return "stop_candidate"
+
+    return "laddering"
 
 
-def generate_question(probe_type):
-    if probe_type == "clarification":
-        return "What do you mean by that?"
-    if probe_type == "concretising":
-        return "Can you give an example?"
-    if probe_type == "laddering":
-        return "Why is that?"
-    return "What else?"
+# ----------------------------
+# LLM Question Generator
+# ----------------------------
+async def generate_deepdive_question(
+    objective,
+    context_label,
+    interview_focus,
+    history,
+    latest_response,
+    probe_type
+):
+
+    messages = [
+        {
+            "role": "system",
+            "content": f"""
+You are a skilled qualitative researcher.
+
+Objective:
+{objective}
+
+Context:
+{context_label}
+
+Focus:
+{interview_focus}
+
+Ask ONE follow-up question.
+
+Rules:
+- One question only
+- Max 20 words
+- Be natural and conversational
+- No repetition
+- No generic questions like "tell me more"
+- Do not lead the respondent
+
+Probe type guidance:
+- clarification → clarify vague answers
+- concretising → ask for example
+- laddering → ask why it matters
+- impact → ask about impact or consequence
+"""
+        },
+        {
+            "role": "user",
+            "content": f"""
+Conversation:
+{history}
+
+Latest response:
+{latest_response}
+
+Probe type: {probe_type}
+
+Ask the next best question.
+"""
+        }
+    ]
+
+    return await _call_openai_chat(messages, DEFAULT_MODEL_FOLLOWUP, 40)
 
 
+# ----------------------------
+# Endpoint (NOW ASYNC)
+# ----------------------------
 @app.post("/deepdive")
-def deepdive(req: DeepDiveRequest):
+async def deepdive(req: DeepDiveRequest):
+
     try:
         session_key = get_session_key(
             req.project_id,
@@ -797,14 +871,18 @@ def deepdive(req: DeepDiveRequest):
 
         context_label = context_rule["label"]
         interview_focus = context_rule.get("interview_focus", "")
+        objective = config.get("objective", "")
 
+        # Evaluate response
         evaluation = evaluate_response_simple(req.response, session["history"])
 
+        # Update streak
         if evaluation["is_dont_know"]:
             session["dont_know_streak"] += 1
         else:
             session["dont_know_streak"] = 0
 
+        # Termination rules
         if session["dont_know_streak"] >= 3:
             return {
                 "context_label": context_label,
@@ -823,8 +901,36 @@ def deepdive(req: DeepDiveRequest):
                 }
             }
 
+        # NEW: early stop if strong answer
+        if evaluation["has_example"] and evaluation["is_specific"]:
+            return {
+                "context_label": context_label,
+                "deepdive": {
+                    "should_continue": False,
+                    "stop_reason": "sufficient_detail"
+                }
+            }
+
         probe_type = select_probe_type(evaluation)
-        question = generate_question(probe_type)
+
+        if probe_type == "stop_candidate":
+            return {
+                "context_label": context_label,
+                "deepdive": {
+                    "should_continue": False,
+                    "stop_reason": "objective_satisfied"
+                }
+            }
+
+        # Generate question via LLM
+        question = await generate_deepdive_question(
+            objective=objective,
+            context_label=context_label,
+            interview_focus=interview_focus,
+            history=session["history"],
+            latest_response=req.response,
+            probe_type=probe_type
+        )
 
         question_code = f"{req.question_id}_{session['turn_count'] + 1}"
 
