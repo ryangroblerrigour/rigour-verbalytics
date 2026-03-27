@@ -671,7 +671,7 @@ async def admin_blocklist_refresh():
         
         }
 # =========================================================
-# DEEPDIVE MODULE (UPGRADED)
+# DEEPDIVE MODULE (CONSISTENCY UPGRADED)
 # =========================================================
 
 SESSIONS = {}
@@ -710,38 +710,16 @@ def evaluate_context_rules(config, prior_answers):
         cond = rule.get("condition", {})
         cond_type = cond.get("type")
 
-        # --- AVERAGE SCORE (existing logic) ---
-        if cond_type == "average_score":
-            questions = cond.get("questions", [])
-            values = [prior_answers.get(q) for q in questions]
-
-            if None in values or not values:
-                continue
-
-            avg = sum(values) / len(values)
-            operator = cond.get("operator")
-            threshold = cond.get("value")
-
-            if operator == "<=" and avg <= threshold:
-                return rule
-            if operator == ">=" and avg >= threshold:
-                return rule
-
-        # --- NEW: VALUE RANGE LOGIC ---
-        elif cond_type == "value_range":
+        if cond_type == "value_range":
             q = cond.get("question")
             val = prior_answers.get(q)
 
             if val is None:
                 continue
 
-            min_val = cond.get("min")
-            max_val = cond.get("max")
-
-            if min_val <= val <= max_val:
+            if cond.get("min") <= val <= cond.get("max"):
                 return rule
 
-        # --- FALLBACK ---
         elif cond_type == "fallback":
             return rule
 
@@ -752,7 +730,7 @@ def evaluate_context_rules(config, prior_answers):
 
 
 # ----------------------------
-# Improved evaluator
+# Response evaluation
 # ----------------------------
 def evaluate_response_simple(response, history):
     r = response.lower().strip()
@@ -768,7 +746,56 @@ def evaluate_response_simple(response, history):
 
 
 # ----------------------------
-# Improved probe selection
+# Sentiment detection (NEW)
+# ----------------------------
+def detect_sentiment(response: str):
+    r = (response or "").lower()
+
+    positive = ["like", "love", "good", "clear", "appealing", "strong", "great", "nice"]
+    negative = ["dislike", "confusing", "unclear", "bad", "boring", "weak"]
+
+    pos = any(w in r for w in positive)
+    neg = any(w in r for w in negative)
+
+    if pos and neg:
+        return "mixed"
+    if pos:
+        return "positive"
+    if neg:
+        return "negative"
+
+    return "neutral"
+
+
+# ----------------------------
+# Consistency logic (NEW)
+# ----------------------------
+def evaluate_consistency(consistency_rules, sentiment):
+
+    if not consistency_rules:
+        return {"status": "none"}
+
+    expected = consistency_rules.get("expected_sentiment")
+
+    if expected == "mixed":
+        if sentiment != "mixed":
+            return {
+                "status": "missing_side",
+                "instruction": "Response is one-sided. Ask for the missing perspective."
+            }
+
+    if expected in ["positive", "negative"]:
+        if sentiment != expected:
+            return {
+                "status": "mismatch",
+                "instruction": "There is a mismatch between score and explanation. Resolve it."
+            }
+
+    return {"status": "aligned"}
+
+
+# ----------------------------
+# Probe selection
 # ----------------------------
 def select_probe_type(evaluation):
 
@@ -788,7 +815,7 @@ def select_probe_type(evaluation):
 
 
 # ----------------------------
-# LLM Question Generator
+# LLM Question Generator (UPDATED)
 # ----------------------------
 async def generate_deepdive_question(
     objective,
@@ -796,7 +823,8 @@ async def generate_deepdive_question(
     interview_focus,
     history,
     latest_response,
-    probe_type
+    probe_type,
+    consistency_instruction=None
 ):
 
     messages = [
@@ -814,6 +842,9 @@ Context:
 Focus:
 {interview_focus}
 
+Consistency instruction:
+{consistency_instruction or "None"}
+
 Ask ONE follow-up question.
 
 Rules:
@@ -821,14 +852,16 @@ Rules:
 - Max 20 words
 - Be natural and conversational
 - No repetition
-- No generic questions like "tell me more"
+- No generic questions
 - Do not lead the respondent
 
-Probe type guidance:
-- clarification → clarify vague answers
-- concretising → ask for example
-- laddering → ask why it matters
-- impact → ask about impact or consequence
+Probe types:
+- clarification
+- concretising
+- laddering
+- impact
+- contradiction → resolve mismatch
+- balance → explore missing side
 """
         },
         {
@@ -851,7 +884,7 @@ Ask the next best question.
 
 
 # ----------------------------
-# Endpoint (NOW ASYNC)
+# Endpoint
 # ----------------------------
 @app.post("/deepdive")
 async def deepdive(req: DeepDiveRequest):
@@ -874,11 +907,7 @@ async def deepdive(req: DeepDiveRequest):
 
         session["history"].append({"role": "user", "text": req.response})
 
-        # Load config
-        try:
-            config = load_question_config(req.project_id, req.question_id)
-        except Exception as e:
-            raise HTTPException(status_code=404, detail=str(e))
+        config = load_question_config(req.project_id, req.question_id)
 
         context_rule = evaluate_context_rules(
             config,
@@ -888,67 +917,51 @@ async def deepdive(req: DeepDiveRequest):
         context_label = context_rule["label"]
         interview_focus = context_rule.get("interview_focus", "")
         objective = config.get("objective", "")
+        consistency_rules = context_rule.get("consistency_rules", {})
 
         # Evaluate response
         evaluation = evaluate_response_simple(req.response, session["history"])
 
-        # Update streak
+        # NEW: consistency detection
+        sentiment = detect_sentiment(req.response)
+        consistency_check = evaluate_consistency(consistency_rules, sentiment)
+        consistency_instruction = consistency_check.get("instruction")
+
+        # Termination
         if evaluation["is_dont_know"]:
             session["dont_know_streak"] += 1
         else:
             session["dont_know_streak"] = 0
 
-        # Termination rules
         if session["dont_know_streak"] >= 3:
-            return {
-                "context_label": context_label,
-                "deepdive": {
-                    "should_continue": False,
-                    "stop_reason": "low_engagement"
-                }
-            }
+            return {"deepdive": {"should_continue": False}}
 
         if session["turn_count"] >= 4:
-            return {
-                "context_label": context_label,
-                "deepdive": {
-                    "should_continue": False,
-                    "stop_reason": "max_turns"
-                }
-            }
+            return {"deepdive": {"should_continue": False}}
 
-        # NEW: early stop if strong answer
         if evaluation["has_example"] and evaluation["is_specific"]:
-            return {
-                "context_label": context_label,
-                "deepdive": {
-                    "should_continue": False,
-                    "stop_reason": "sufficient_detail"
-                }
-            }
+            return {"deepdive": {"should_continue": False}}
 
-        probe_type = select_probe_type(evaluation)
+        # Probe selection (UPDATED)
+        if consistency_check["status"] == "mismatch":
+            probe_type = "contradiction"
+        elif consistency_check["status"] == "missing_side":
+            probe_type = "balance"
+        else:
+            probe_type = select_probe_type(evaluation)
 
         if probe_type == "stop_candidate":
-            return {
-                "context_label": context_label,
-                "deepdive": {
-                    "should_continue": False,
-                    "stop_reason": "objective_satisfied"
-                }
-            }
+            return {"deepdive": {"should_continue": False}}
 
-        # Generate question via LLM
         question = await generate_deepdive_question(
-            objective=objective,
-            context_label=context_label,
-            interview_focus=interview_focus,
-            history=session["history"],
-            latest_response=req.response,
-            probe_type=probe_type
+            objective,
+            context_label,
+            interview_focus,
+            session["history"],
+            req.response,
+            probe_type,
+            consistency_instruction
         )
-
-        question_code = f"{req.question_id}_{session['turn_count'] + 1}"
 
         session["history"].append({"role": "assistant", "text": question})
         session["turn_count"] += 1
@@ -956,14 +969,11 @@ async def deepdive(req: DeepDiveRequest):
         return {
             "context_label": context_label,
             "deepdive": {
-                "question_code": question_code,
                 "next_question": question,
                 "probe_type": probe_type,
                 "should_continue": True
             }
         }
 
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
