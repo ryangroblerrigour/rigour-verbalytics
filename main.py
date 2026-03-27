@@ -788,8 +788,8 @@ def deepdive(req: DeepDiveRequest):
     # Load config
     try:
     config = load_question_config(req.project_id, req.question_id)
-    except Exception as e:
-      raise HTTPException(status_code=404, detail=str(e))
+except Exception as e:
+    raise HTTPException(status_code=404, detail=str(e))
 
     # Context logic
     context_rule = evaluate_context_rules(
