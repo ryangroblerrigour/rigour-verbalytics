@@ -1,0 +1,82 @@
+{
+  "project_id": "project002",
+  "question_id": "MA1_MANIFESTO",
+
+  "main_question": "What made you give it that score?",
+
+  "objective": "Understand why the No7 manifesto does or does not resonate, identifying specific elements that drive appeal or disengagement.",
+
+  "probe_goal": "Extract clear, specific feedback on what is appealing and unappealing in the manifesto, and ensure alignment between score and reasoning.",
+
+  "focus_areas": [
+    "message clarity",
+    "brand promise",
+    "tone and language",
+    "emotional resonance",
+    "credibility",
+    "relevance to respondent",
+    "specific words or phrases",
+    "overall impression"
+  ],
+
+  "avoid_areas": [
+    "generic opinions without reference to the manifesto",
+    "hypothetical scenarios",
+    "overly abstract emotional probing without evidence"
+  ],
+
+  "context_rules": [
+    {
+      "label": "low_score",
+      "description": "Score between 1–4",
+      "condition": {
+        "type": "value_range",
+        "question": "MA1_MANIFESTO_SCORE",
+        "min": 1,
+        "max": 4
+      },
+      "interview_focus": "Understand what is unappealing, unclear, or not resonating, and identify specific weaknesses in the manifesto.",
+      "consistency_rules": {
+        "expected_sentiment": "negative",
+        "if_mismatch": "Respondent gives positive feedback but low score → probe contradiction"
+      }
+    },
+    {
+      "label": "mid_score",
+      "description": "Score between 5–6",
+      "condition": {
+        "type": "value_range",
+        "question": "MA1_MANIFESTO_SCORE",
+        "min": 5,
+        "max": 6
+      },
+      "interview_focus": "Explore both what works and what does not work, identifying trade-offs and mixed perceptions.",
+      "consistency_rules": {
+        "expected_sentiment": "mixed",
+        "if_missing_side": "If only positive or only negative is mentioned → probe the missing side"
+      }
+    },
+    {
+      "label": "high_score",
+      "description": "Score between 7–10",
+      "condition": {
+        "type": "value_range",
+        "question": "MA1_MANIFESTO_SCORE",
+        "min": 7,
+        "max": 10
+      },
+      "interview_focus": "Understand what is resonating strongly and which elements drive appeal and connection.",
+      "consistency_rules": {
+        "expected_sentiment": "positive",
+        "if_mismatch": "Respondent gives negative feedback but high score → probe contradiction"
+      }
+    },
+    {
+      "label": "neutral",
+      "condition": {
+        "type": "fallback"
+      },
+      "interview_focus": "Explore both positive and negative reactions and clarify overall perception."
+    }
+  ]
+}
