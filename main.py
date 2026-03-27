@@ -766,84 +766,82 @@ def generate_question(probe_type):
 
 @app.post("/deepdive")
 def deepdive(req: DeepDiveRequest):
-
-    session_key = get_session_key(
-        req.project_id,
-        req.respondent_id,
-        req.question_id
-    )
-
-    if session_key not in SESSIONS:
-        SESSIONS[session_key] = {
-            "history": [],
-            "turn_count": 0,
-            "dont_know_streak": 0
-        }
-
-    session = SESSIONS[session_key]
-
-    # Store response
-    session["history"].append({"role": "user", "text": req.response})
-  
-    # Load config
     try:
-      config = load_question_config(req.project_id, req.question_id)
+        session_key = get_session_key(
+            req.project_id,
+            req.respondent_id,
+            req.question_id
+        )
+
+        if session_key not in SESSIONS:
+            SESSIONS[session_key] = {
+                "history": [],
+                "turn_count": 0,
+                "dont_know_streak": 0
+            }
+
+        session = SESSIONS[session_key]
+
+        session["history"].append({"role": "user", "text": req.response})
+
+        # Load config
+        try:
+            config = load_question_config(req.project_id, req.question_id)
+        except Exception as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+        context_rule = evaluate_context_rules(
+            config,
+            req.prior_answers or {}
+        )
+
+        context_label = context_rule["label"]
+        interview_focus = context_rule.get("interview_focus", "")
+
+        evaluation = evaluate_response_simple(req.response, session["history"])
+
+        if evaluation["is_dont_know"]:
+            session["dont_know_streak"] += 1
+        else:
+            session["dont_know_streak"] = 0
+
+        if session["dont_know_streak"] >= 3:
+            return {
+                "context_label": context_label,
+                "deepdive": {
+                    "should_continue": False,
+                    "stop_reason": "low_engagement"
+                }
+            }
+
+        if session["turn_count"] >= 4:
+            return {
+                "context_label": context_label,
+                "deepdive": {
+                    "should_continue": False,
+                    "stop_reason": "max_turns"
+                }
+            }
+
+        probe_type = select_probe_type(evaluation)
+        question = generate_question(probe_type)
+
+        question_code = f"{req.question_id}_{session['turn_count'] + 1}"
+
+        session["history"].append({"role": "assistant", "text": question})
+        session["turn_count"] += 1
+
+        return {
+            "context_label": context_label,
+            "deepdive": {
+                "question_code": question_code,
+                "next_question": question,
+                "probe_type": probe_type,
+                "should_continue": True
+            }
+        }
+
+    except HTTPException:
+        raise
     except Exception as e:
-      raise HTTPException(status_code=404, detail=str(e))
-
-    # Context logic
-    context_rule = evaluate_context_rules(
-        config,
-        req.prior_answers or {}
-    )
-
-    context_label = context_rule["label"]
-    interview_focus = context_rule.get("interview_focus", "")
-
-    # Evaluate response
-    evaluation = evaluate_response_simple(req.response, session["history"])
-
-    # Update streak
-    if evaluation["is_dont_know"]:
-        session["dont_know_streak"] += 1
-    else:
-        session["dont_know_streak"] = 0
-
-    # Termination rules
-    if session["dont_know_streak"] >= 3:
-        return {
-            "context_label": context_label,
-            "deepdive": {
-                "should_continue": False,
-                "stop_reason": "low_engagement"
-            }
-        }
-
-    if session["turn_count"] >= 4:
-        return {
-            "context_label": context_label,
-            "deepdive": {
-                "should_continue": False,
-                "stop_reason": "max_turns"
-            }
-        }
-
-    # Select probe
-    probe_type = select_probe_type(evaluation)
-
-    # Generate question
-    question = generate_question(probe_type)
-
-    # Store assistant turn
-    session["history"].append({"role": "assistant", "text": question})
-    session["turn_count"] += 1
-
-    return {
-    "context_label": context_label,
-    "deepdive": {
-        "question_code": question_code,
-        "next_question": question,
-        "probe_type": probe_type,
-        "should_continue": True
-    }
-}
+        raise HTTPException(status_code=500, detail=str(e))
