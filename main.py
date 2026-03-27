@@ -671,7 +671,7 @@ async def admin_blocklist_refresh():
         
         }
 # =========================================================
-# DEEPDIVE MODULE (CONSISTENCY + STABILITY FIXED)
+# DEEPDIVE MODULE (CONSISTENCY + IMPROVEMENT LOGIC)
 # =========================================================
 
 SESSIONS = {}
@@ -717,7 +717,10 @@ def evaluate_context_rules(config, prior_answers):
             if val is None:
                 continue
 
-            if cond.get("min") <= val <= cond.get("max"):
+            min_val = cond.get("min")
+            max_val = cond.get("max")
+
+            if min_val <= val <= max_val:
                 return rule
 
         elif cond_type == "fallback":
@@ -733,7 +736,7 @@ def evaluate_context_rules(config, prior_answers):
 # Response evaluation
 # ----------------------------
 def evaluate_response_simple(response, history):
-    r = response.lower().strip()
+    r = (response or "").lower().strip()
 
     return {
         "is_dont_know": r in ["dont know", "don't know", "not sure", "idk"],
@@ -746,73 +749,97 @@ def evaluate_response_simple(response, history):
 
 
 # ----------------------------
-# STRONG sentiment detection
+# Sentiment detection
+# IMPORTANT:
+# Return explicit polarity only when the respondent
+# actually expresses polarity.
 # ----------------------------
 def detect_sentiment(response: str):
-    r = (response or "").lower()
+    r = (response or "").lower().strip()
 
     negative_phrases = [
         "don't like", "dont like", "do not like",
         "dislike", "hate", "not good", "not clear",
-        "doesn't make sense", "doesnt make sense"
+        "doesn't make sense", "doesnt make sense",
+        "confusing", "unclear", "boring", "weak", "bad"
     ]
-
     for p in negative_phrases:
         if p in r:
             return "negative"
 
     positive_phrases = [
-        "i like", "like it", "love", "really like", "very good"
+        "i like", "like it", "love", "really like",
+        "very good", "appealing", "clear", "strong", "great", "nice"
     ]
-
     for p in positive_phrases:
         if p in r:
             return "positive"
-
-    positive = ["good", "clear", "appealing", "strong", "great", "nice"]
-    negative = ["confusing", "unclear", "bad", "boring", "weak"]
-
-    pos = any(w in r for w in positive)
-    neg = any(w in r for w in negative)
-
-    if pos and neg:
-        return "mixed"
-    if neg:
-        return "negative"
-    if pos:
-        return "positive"
 
     return "neutral"
 
 
 # ----------------------------
-# SAFE consistency logic
+# Use prior user sentiment if current answer is
+# a short fragment with no explicit polarity.
+# Example:
+# user 1: "I liked the aesthetic" -> positive
+# user 2: "the overall message" -> inherit positive
 # ----------------------------
-def evaluate_consistency(consistency_rules, sentiment, evaluation):
+def infer_effective_sentiment(latest_response: str, history, context_label: str):
+    current = detect_sentiment(latest_response)
+
+    if current != "neutral":
+        return current
+
+    latest_words = len((latest_response or "").split())
+    if latest_words <= 5:
+        prior_user_turns = [h for h in history if h["role"] == "user" and h["text"] != latest_response]
+        for prev in reversed(prior_user_turns):
+            prev_sentiment = detect_sentiment(prev["text"])
+            if prev_sentiment != "neutral":
+                return prev_sentiment
+
+    # If still neutral, do not force contradiction.
+    # We keep neutral as neutral.
+    return "neutral"
+
+
+# ----------------------------
+# Consistency logic
+# IMPORTANT:
+# Only explicit opposite sentiment = contradiction.
+# Neutral fragments do NOT count as mismatch.
+# ----------------------------
+def evaluate_consistency(consistency_rules, sentiment):
 
     if not consistency_rules:
         return {"status": "none"}
 
     expected = consistency_rules.get("expected_sentiment")
 
-    # Define weak response
-    weak_response = evaluation["is_vague"] and not evaluation["has_reason"]
-
-    # Only trigger contradiction on weak responses
-    if expected in ["positive", "negative"]:
-        if sentiment != expected and weak_response:
-            return {
-                "status": "mismatch",
-                "instruction": "Resolve mismatch between score and explanation."
-            }
-
-    # Mid score logic
     if expected == "mixed":
-        if sentiment != "mixed":
+        if sentiment in ["positive", "negative"]:
             return {
                 "status": "missing_side",
-                "instruction": "Ask for the missing perspective."
+                "instruction": "Response is one-sided. Ask for the missing perspective."
             }
+        return {"status": "aligned"}
+
+    if expected == "positive":
+        if sentiment == "negative":
+            return {
+                "status": "mismatch",
+                "instruction": "The score is positive but the explanation sounds negative. Gently resolve that tension."
+            }
+        return {"status": "aligned"}
+
+    if expected == "negative":
+        if sentiment == "positive":
+            return {
+                "status": "mismatch",
+                "instruction": "The score is low but the explanation sounds positive. Gently resolve that tension."
+            }
+        return {"status": "aligned"}
 
     return {"status": "aligned"}
 
@@ -820,7 +847,14 @@ def evaluate_consistency(consistency_rules, sentiment, evaluation):
 # ----------------------------
 # Probe selection
 # ----------------------------
-def select_probe_type(evaluation):
+def select_probe_type(evaluation, context_label, turn_count, sentiment):
+    # High score: after one positive answer, move toward optimisation
+    if context_label == "high_score" and turn_count >= 1 and sentiment in ["positive", "neutral"]:
+        return "improvement"
+
+    # Low score: after one negative answer, move toward specifics
+    if context_label == "low_score" and turn_count >= 1 and sentiment in ["negative", "neutral"]:
+        return "concretising"
 
     if evaluation["is_vague"]:
         return "clarification"
@@ -875,15 +909,26 @@ Rules:
 - Max 20 words
 - Be natural and conversational
 - No repetition
-- Do not lead the respondent
+- No generic questions like "tell me more"
+- Do not invent contradictions
+- Do not compare two ideas unless the respondent has clearly contrasted them
+- If the respondent gives a short fragment, treat it as an extension of their prior answer
 
-Probe types:
-- clarification
-- concretising
-- laddering
-- impact
-- contradiction → resolve mismatch
-- balance → explore missing side
+Probe type guidance:
+- clarification -> clarify vague answers
+- concretising -> ask what specifically they mean
+- laddering -> ask why it matters
+- impact -> ask about consequence
+- contradiction -> gently resolve a true mismatch
+- balance -> ask for the missing positive or negative side
+- improvement -> ask what would make it resonate even more
+
+For high scores, improvement questions are often best phrased as:
+- What could make this resonate even more?
+- How could this be strengthened further?
+- What could be updated to make it more compelling?
+
+Return only the question.
 """
         },
         {
@@ -941,53 +986,87 @@ async def deepdive(req: DeepDiveRequest):
         objective = config.get("objective", "")
         consistency_rules = context_rule.get("consistency_rules", {})
 
-        # Evaluate response
         evaluation = evaluate_response_simple(req.response, session["history"])
 
-        # Sentiment + consistency
-        sentiment = detect_sentiment(req.response)
+        effective_sentiment = infer_effective_sentiment(
+            latest_response=req.response,
+            history=session["history"],
+            context_label=context_label
+        )
+
         consistency_check = evaluate_consistency(
             consistency_rules,
-            sentiment,
-            evaluation
+            effective_sentiment
         )
         consistency_instruction = consistency_check.get("instruction")
 
-        # Termination rules
+        # Update streak
         if evaluation["is_dont_know"]:
             session["dont_know_streak"] += 1
         else:
             session["dont_know_streak"] = 0
 
+        # Termination rules
         if session["dont_know_streak"] >= 3:
-            return {"deepdive": {"should_continue": False}}
+            return {
+                "context_label": context_label,
+                "deepdive": {
+                    "should_continue": False,
+                    "stop_reason": "low_engagement"
+                }
+            }
 
         if session["turn_count"] >= 4:
-            return {"deepdive": {"should_continue": False}}
+            return {
+                "context_label": context_label,
+                "deepdive": {
+                    "should_continue": False,
+                    "stop_reason": "max_turns"
+                }
+            }
 
         if evaluation["has_example"] and evaluation["is_specific"]:
-            return {"deepdive": {"should_continue": False}}
+            return {
+                "context_label": context_label,
+                "deepdive": {
+                    "should_continue": False,
+                    "stop_reason": "sufficient_detail"
+                }
+            }
 
-        # Probe logic (FIXED)
+        # Probe logic
         if consistency_check["status"] == "mismatch":
             probe_type = "contradiction"
         elif consistency_check["status"] == "missing_side":
             probe_type = "balance"
         else:
-            probe_type = select_probe_type(evaluation)
+            probe_type = select_probe_type(
+                evaluation=evaluation,
+                context_label=context_label,
+                turn_count=session["turn_count"],
+                sentiment=effective_sentiment
+            )
 
         if probe_type == "stop_candidate":
-            return {"deepdive": {"should_continue": False}}
+            return {
+                "context_label": context_label,
+                "deepdive": {
+                    "should_continue": False,
+                    "stop_reason": "objective_satisfied"
+                }
+            }
 
         question = await generate_deepdive_question(
-            objective,
-            context_label,
-            interview_focus,
-            session["history"],
-            req.response,
-            probe_type,
-            consistency_instruction
+            objective=objective,
+            context_label=context_label,
+            interview_focus=interview_focus,
+            history=session["history"],
+            latest_response=req.response,
+            probe_type=probe_type,
+            consistency_instruction=consistency_instruction
         )
+
+        question_code = f"{req.question_id}_{session['turn_count'] + 1}"
 
         session["history"].append({"role": "assistant", "text": question})
         session["turn_count"] += 1
@@ -995,11 +1074,14 @@ async def deepdive(req: DeepDiveRequest):
         return {
             "context_label": context_label,
             "deepdive": {
+                "question_code": question_code,
                 "next_question": question,
                 "probe_type": probe_type,
                 "should_continue": True
             }
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
