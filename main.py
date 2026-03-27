@@ -710,6 +710,7 @@ def evaluate_context_rules(config, prior_answers):
         cond = rule.get("condition", {})
         cond_type = cond.get("type")
 
+        # --- AVERAGE SCORE (existing logic) ---
         if cond_type == "average_score":
             questions = cond.get("questions", [])
             values = [prior_answers.get(q) for q in questions]
@@ -726,6 +727,21 @@ def evaluate_context_rules(config, prior_answers):
             if operator == ">=" and avg >= threshold:
                 return rule
 
+        # --- NEW: VALUE RANGE LOGIC ---
+        elif cond_type == "value_range":
+            q = cond.get("question")
+            val = prior_answers.get(q)
+
+            if val is None:
+                continue
+
+            min_val = cond.get("min")
+            max_val = cond.get("max")
+
+            if min_val <= val <= max_val:
+                return rule
+
+        # --- FALLBACK ---
         elif cond_type == "fallback":
             return rule
 
