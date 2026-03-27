@@ -671,7 +671,7 @@ async def admin_blocklist_refresh():
         
         }
 # =========================================================
-# DEEPDIVE MODULE (CONSISTENCY UPGRADED)
+# DEEPDIVE MODULE (CONSISTENCY + STABILITY FIXED)
 # =========================================================
 
 SESSIONS = {}
@@ -746,24 +746,31 @@ def evaluate_response_simple(response, history):
 
 
 # ----------------------------
-# Sentiment detection (NEW)
+# STRONG sentiment detection
 # ----------------------------
 def detect_sentiment(response: str):
     r = (response or "").lower()
 
-    # Strong patterns first (phrases)
-    if "don't like" in r or "dont like" in r:
-        return "negative"
+    negative_phrases = [
+        "don't like", "dont like", "do not like",
+        "dislike", "hate", "not good", "not clear",
+        "doesn't make sense", "doesnt make sense"
+    ]
 
-    if "do not like" in r:
-        return "negative"
+    for p in negative_phrases:
+        if p in r:
+            return "negative"
 
-    if "like it" in r or "i like" in r:
-        return "positive"
+    positive_phrases = [
+        "i like", "like it", "love", "really like", "very good"
+    ]
 
-    # Keyword fallback
-    positive = ["like", "love", "good", "clear", "appealing", "strong", "great", "nice"]
-    negative = ["dislike", "confusing", "unclear", "bad", "boring", "weak", "hate"]
+    for p in positive_phrases:
+        if p in r:
+            return "positive"
+
+    positive = ["good", "clear", "appealing", "strong", "great", "nice"]
+    negative = ["confusing", "unclear", "bad", "boring", "weak"]
 
     pos = any(w in r for w in positive)
     neg = any(w in r for w in negative)
@@ -777,28 +784,34 @@ def detect_sentiment(response: str):
 
     return "neutral"
 
+
 # ----------------------------
-# Consistency logic (NEW)
+# SAFE consistency logic
 # ----------------------------
-def evaluate_consistency(consistency_rules, sentiment):
+def evaluate_consistency(consistency_rules, sentiment, evaluation):
 
     if not consistency_rules:
         return {"status": "none"}
 
     expected = consistency_rules.get("expected_sentiment")
 
+    # Define weak response
+    weak_response = evaluation["is_vague"] and not evaluation["has_reason"]
+
+    # Only trigger contradiction on weak responses
+    if expected in ["positive", "negative"]:
+        if sentiment != expected and weak_response:
+            return {
+                "status": "mismatch",
+                "instruction": "Resolve mismatch between score and explanation."
+            }
+
+    # Mid score logic
     if expected == "mixed":
         if sentiment != "mixed":
             return {
                 "status": "missing_side",
-                "instruction": "Response is one-sided. Ask for the missing perspective."
-            }
-
-    if expected in ["positive", "negative"]:
-        if sentiment != expected:
-            return {
-                "status": "mismatch",
-                "instruction": "There is a mismatch between score and explanation. Resolve it."
+                "instruction": "Ask for the missing perspective."
             }
 
     return {"status": "aligned"}
@@ -825,7 +838,7 @@ def select_probe_type(evaluation):
 
 
 # ----------------------------
-# LLM Question Generator (UPDATED)
+# LLM Question Generator
 # ----------------------------
 async def generate_deepdive_question(
     objective,
@@ -862,7 +875,6 @@ Rules:
 - Max 20 words
 - Be natural and conversational
 - No repetition
-- No generic questions
 - Do not lead the respondent
 
 Probe types:
@@ -932,12 +944,16 @@ async def deepdive(req: DeepDiveRequest):
         # Evaluate response
         evaluation = evaluate_response_simple(req.response, session["history"])
 
-        # NEW: consistency detection
+        # Sentiment + consistency
         sentiment = detect_sentiment(req.response)
-        consistency_check = evaluate_consistency(consistency_rules, sentiment)
+        consistency_check = evaluate_consistency(
+            consistency_rules,
+            sentiment,
+            evaluation
+        )
         consistency_instruction = consistency_check.get("instruction")
 
-        # Termination
+        # Termination rules
         if evaluation["is_dont_know"]:
             session["dont_know_streak"] += 1
         else:
@@ -952,7 +968,7 @@ async def deepdive(req: DeepDiveRequest):
         if evaluation["has_example"] and evaluation["is_specific"]:
             return {"deepdive": {"should_continue": False}}
 
-        # Probe selection (UPDATED)
+        # Probe logic (FIXED)
         if consistency_check["status"] == "mismatch":
             probe_type = "contradiction"
         elif consistency_check["status"] == "missing_side":
