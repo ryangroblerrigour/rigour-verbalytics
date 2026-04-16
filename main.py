@@ -677,3 +677,10 @@ async def admin_blocklist_refresh():
     "is_loop": True
   }
 }
+# =========================================================
+# DEEPDIVE MODULE (TEMP ROUTE CHECK)
+# =========================================================
+
+@app.post("/deepdive")
+async def deepdive_test():
+    return {"ok": True, "route": "deepdive"}
