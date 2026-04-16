@@ -663,7 +663,7 @@ async def admin_blocklist_refresh():
 
 
 # =========================================================
-# DEEPDIVE MODULE (STAGE 3 - ROUTE + RESPONSE AWARE)
+# DEEPDIVE MODULE (STAGE 4 - BETTER LANGUAGE FOLLOW-UPS)
 # =========================================================
 
 SESSIONS = {}
@@ -728,6 +728,13 @@ def evaluate_route(config, prior_answers):
 def evaluate_response_veronica(response: str):
     rl = (response or "").lower().strip()
 
+    criticism_words = [
+        "generic", "bland", "unclear", "confusing", "overused",
+        "flat", "vague", "weak", "boring", "too much", "too little"
+    ]
+
+    quoted_phrase = ("'" in response) or ('"' in response)
+
     return {
         "mentions_language": any(
             x in rl for x in [
@@ -753,7 +760,9 @@ def evaluate_response_veronica(response: str):
                 "connect", "doesn't connect", "doesnt connect"
             ]
         ),
-        "is_vague": len(rl.split()) < 5
+        "is_vague": len(rl.split()) < 5,
+        "has_criticism_word": any(x in rl for x in criticism_words),
+        "quoted_phrase": quoted_phrase
     }
 
 
@@ -763,6 +772,7 @@ def is_invalid_response(response: str) -> bool:
 
     if not r:
         return True
+
     if r.isdigit():
         return True
 
@@ -788,41 +798,68 @@ def generate_repair_question(previous_question: str, bad_response: str) -> str:
 
 
 def choose_next_question(route_label: str, evaluation: dict):
+    # LOW SCORE
     if route_label == "low_score":
         if evaluation["mentions_language"]:
+            if evaluation["quoted_phrase"]:
+                return "What is it about that wording or phrase that doesn’t work for you?", "ask_why_that_wording"
+            if evaluation["has_criticism_word"]:
+                return "Which words or phrases made it feel that way to you?", "ask_which_words"
             return "What specifically about the tone or wording didn’t work for you?", "ask_specific_words"
+
         elif evaluation["mentions_visuals"]:
+            if evaluation["has_criticism_word"]:
+                return "What specifically in the visuals or design made it feel that way?", "ask_which_visuals"
             return "What specifically about the visuals or design didn’t work for you?", "ask_specific_visuals"
+
         elif evaluation["mentions_meaning"]:
             return "What about the message or meaning didn’t feel right to you?", "ask_meaning"
+
         else:
             return "What specifically about it didn’t work for you?", "ask_specifics"
 
+    # MID SCORE
     elif route_label == "mid_score":
         if evaluation["mentions_language"]:
+            if evaluation["has_criticism_word"]:
+                return "Which parts of the wording worked for you, and which didn’t?", "explore_both_sides"
             return "What about the wording worked for you, and what didn’t?", "explore_both_sides"
+
         elif evaluation["mentions_visuals"]:
             return "What about the visuals or design worked for you, and what didn’t?", "explore_both_sides"
+
         else:
             return "What worked for you, and what didn’t?", "explore_both_sides"
 
+    # HIGH SCORE
     elif route_label == "high_score":
         if evaluation["mentions_language"]:
+            if evaluation["quoted_phrase"]:
+                return "What is it about that wording or phrase that resonated with you?", "ask_why_that_wording"
             return "What specifically about the wording or tone resonated with you?", "ask_specific_words"
+
         elif evaluation["mentions_visuals"]:
             return "What specifically about the visuals or design resonated with you?", "ask_specific_visuals"
+
         elif evaluation["mentions_meaning"]:
             return "What about the message or meaning connected with you?", "ask_meaning"
+
         else:
             return "What specifically made it resonate with you?", "ask_specifics"
 
+    # NEUTRAL / FALLBACK
     else:
         if evaluation["mentions_language"]:
+            if evaluation["has_criticism_word"]:
+                return "Which words or phrases made you feel that way?", "ask_which_words"
             return "What specifically about the wording or tone stood out to you?", "ask_specific_words"
+
         elif evaluation["mentions_visuals"]:
             return "What specifically about the visuals or design stood out to you?", "ask_specific_visuals"
+
         elif evaluation["mentions_meaning"]:
             return "What about the message or meaning stood out to you?", "ask_meaning"
+
         else:
             return "What specifically do you mean by that?", "clarify"
 
@@ -852,12 +889,8 @@ async def deepdive(req: DeepDiveRequest):
         route = evaluate_route(config, req.prior_answers or {})
         route_label = route.get("label", "neutral")
 
-        # Store respondent answer
         session["history"].append({"role": "user", "text": req.response})
 
-        # -------------------------------------------------
-        # LOOP / REPAIR
-        # -------------------------------------------------
         if is_invalid_response(req.response):
             session["repair_count"] += 1
 
@@ -884,7 +917,7 @@ async def deepdive(req: DeepDiveRequest):
             repair_question = generate_repair_question(previous_question, req.response)
 
             session["history"].append({"role": "assistant", "text": repair_question})
-            session["current_question_text"] = previous_question  # keep anchor stable during loop
+            session["current_question_text"] = previous_question
 
             return {
                 "route": route_label,
@@ -901,7 +934,6 @@ async def deepdive(req: DeepDiveRequest):
                 }
             }
 
-        # Valid answer, reset repair count
         session["repair_count"] = 0
 
         evaluation = evaluate_response_veronica(req.response)
