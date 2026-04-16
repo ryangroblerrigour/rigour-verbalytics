@@ -663,8 +663,10 @@ async def admin_blocklist_refresh():
 
 
 # =========================================================
-# DEEPDIVE MODULE (STAGE 1 STUB)
+# DEEPDIVE MODULE (STAGE 2 - ROUTE + CONFIG)
 # =========================================================
+
+SESSIONS = {}
 
 class DeepDiveRequest(BaseModel):
     project_id: str
@@ -674,19 +676,111 @@ class DeepDiveRequest(BaseModel):
     prior_answers: Optional[Dict[str, float]] = None
 
 
+def get_session_key(project_id, respondent_id, question_id):
+    return f"{project_id}_{respondent_id}_{question_id}"
+
+
+def load_question_config(project_id, question_id):
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(
+        base_dir,
+        "configs",
+        "projects",
+        project_id,
+        f"{question_id}.json"
+    )
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Config not found at {path}")
+
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def evaluate_route(config, prior_answers):
+    context = config.get("context", {})
+    inputs = context.get("inputs", {})
+    score_source = inputs.get("score_source")
+    routes = context.get("routes", [])
+    fallback_route = context.get("fallback_route", "neutral")
+
+    score_val = None
+    if score_source:
+        score_val = prior_answers.get(score_source)
+
+    if score_val is not None:
+        for route in routes:
+            rng = route.get("range")
+            if not rng or len(rng) != 2:
+                continue
+            if rng[0] <= score_val <= rng[1]:
+                return {
+                    "label": route.get("label", fallback_route),
+                    "focus": route.get("focus", "")
+                }
+
+    return {
+        "label": fallback_route,
+        "focus": "Explore the respondent's answer in depth and clarify what they mean."
+    }
+
+
 @app.post("/deepdive")
 async def deepdive(req: DeepDiveRequest):
-    return {
-        "route": "test",
-        "decision": {
-            "action": "clarify",
-            "reason": "route_live"
-        },
-        "deepdive": {
-            "question_code": f"{req.question_id}_1",
-            "next_question": "What specifically do you mean by that?",
-            "action": "clarify",
-            "should_continue": True,
-            "is_loop": False
+    try:
+        session_key = get_session_key(
+            req.project_id,
+            req.respondent_id,
+            req.question_id
+        )
+
+        if session_key not in SESSIONS:
+            SESSIONS[session_key] = {
+                "history": [],
+                "turn_count": 0
+            }
+
+        session = SESSIONS[session_key]
+        session["history"].append({"role": "user", "text": req.response})
+
+        config = load_question_config(req.project_id, req.question_id)
+        route = evaluate_route(config, req.prior_answers or {})
+
+        question_code = f"{req.question_id}_{session['turn_count'] + 1}"
+
+        # still simple for now, but route-aware
+        if route["label"] == "low_score":
+            next_question = "What specifically about it didn’t work for you?"
+            action = "ask_specifics"
+        elif route["label"] == "mid_score":
+            next_question = "What worked for you, and what didn’t?"
+            action = "explore_both_sides"
+        elif route["label"] == "high_score":
+            next_question = "What specifically made it resonate with you?"
+            action = "ask_specifics"
+        else:
+            next_question = "What specifically do you mean by that?"
+            action = "clarify"
+
+        session["history"].append({"role": "assistant", "text": next_question})
+        session["turn_count"] += 1
+
+        return {
+            "route": route["label"],
+            "decision": {
+                "action": action,
+                "reason": "route_selected"
+            },
+            "deepdive": {
+                "question_code": question_code,
+                "next_question": next_question,
+                "action": action,
+                "should_continue": True,
+                "is_loop": False
+            }
         }
-    }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
