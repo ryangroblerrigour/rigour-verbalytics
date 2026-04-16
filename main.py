@@ -676,6 +676,6 @@ async def admin_blocklist_refresh():
     "next_question": "...",
     "action": "repair",
     "should_continue": True,
-    "is_loop": true
+    "is_loop": True
   }
 }
