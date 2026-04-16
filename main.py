@@ -23,19 +23,25 @@ Run locally:
 """
 from __future__ import annotations
 
-import os, time, asyncio, csv, requests, json
+import os
+import time
+import asyncio
+import csv
+import json
+import requests
 from typing import Optional, Literal, Dict, Any
 from time import monotonic
 from threading import RLock
 
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 try:
     from openai import OpenAI
 except Exception:
-    OpenAI = None  # service will error at call-time if not installed
+    OpenAI = None
 
 
 # ---------------------------------------------------------------------
@@ -50,18 +56,13 @@ OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "12.0"))
 
 BLOCKLIST_CSV_URL = os.getenv("GOOGLE_BLOCKLIST_SHEET", "")
 BLOCKLIST_REFRESH_SECONDS = int(os.getenv("VERBALYTICS_BLOCKLIST_REFRESH_SECONDS", "300"))
-INPUT_BLOCK_MODE = os.getenv("VERBALYTICS_BLOCK_INPUT_MODE", "flag").lower()  # off | flag | reject
+INPUT_BLOCK_MODE = os.getenv("VERBALYTICS_BLOCK_INPUT_MODE", "flag").lower()
 
 
 # ---------------------------------------------------------------------
-# Locale helpers (forces ack/followup/snapback language)
+# Locale helpers
 # ---------------------------------------------------------------------
 def _locale_instruction(locale: Optional[str]) -> str:
-    """
-    We only need a simple, predictable behaviour: output language matches locale.
-    Accepts: en, fr, de, it, es, tr, zh, ar, ko (also accepts regional variants like ar-SA).
-    Unknown -> English.
-    """
     loc = (locale or "en").strip().lower().replace("_", "-")
 
     if loc.startswith("ar"):
@@ -90,6 +91,7 @@ def _locale_instruction(locale: Optional[str]) -> str:
 # ---------------------------------------------------------------------
 _client: Optional[OpenAI] = None
 
+
 def get_client() -> OpenAI:
     global _client
     if _client is None:
@@ -104,6 +106,7 @@ def get_client() -> OpenAI:
 # ---------------------------------------------------------------------
 TaskName = Literal["check", "score", "ack", "followup"]
 
+
 class VerbalyticsInput(BaseModel):
     question: str
     response: str
@@ -111,6 +114,7 @@ class VerbalyticsInput(BaseModel):
     locale: Optional[str] = "en"
     context: Optional[Dict[str, Any]] = None
     project_id: Optional[str] = None
+
 
 class VerbalyticsOutput(BaseModel):
     subscores: Optional[Dict[str, int]] = None
@@ -124,7 +128,7 @@ class VerbalyticsOutput(BaseModel):
 
 
 # ---------------------------------------------------------------------
-# Blocklist Loader (global + project)
+# Blocklist Loader
 # ---------------------------------------------------------------------
 _block_lock = RLock()
 _block_global: set[str] = set()
@@ -132,8 +136,10 @@ _block_projects: dict[str, set[str]] = {}
 _block_loaded_at: float = 0.0
 _block_version: int = 0
 
+
 def _norm(s: str) -> str:
     return (s or "").strip().lower()
+
 
 def _load_blocklist_csv(url: str) -> tuple[set[str], dict[str, set[str]]]:
     g, p = set(), {}
@@ -154,9 +160,9 @@ def _load_blocklist_csv(url: str) -> tuple[set[str], dict[str, set[str]]]:
             elif scope == "project" and proj:
                 p.setdefault(proj, set()).add(phrase)
     except Exception:
-        # keep previous cache on error
         pass
     return g, p
+
 
 def _refresh_blocklist(force: bool = False) -> None:
     global _block_global, _block_projects, _block_loaded_at, _block_version
@@ -171,6 +177,7 @@ def _refresh_blocklist(force: bool = False) -> None:
             _block_loaded_at = now
             _block_version += 1
 
+
 def get_block_phrases(project_id: Optional[str]) -> set[str]:
     _refresh_blocklist(False)
     with _block_lock:
@@ -179,11 +186,13 @@ def get_block_phrases(project_id: Optional[str]) -> set[str]:
             phrases |= _block_projects.get(_norm(project_id), set())
         return phrases
 
+
 def contains_blocked_phrase(text: str, project_id: Optional[str]) -> bool:
     if not text:
         return False
     lt = text.lower()
     return any(p in lt for p in get_block_phrases(project_id))
+
 
 def find_blocked_phrases(text: str, project_id: Optional[str]) -> list[str]:
     if not text:
@@ -220,7 +229,6 @@ class ScoreEngine:
         r_set = set(r_toks)
         wc = len(r_toks)
 
-        # Specificity
         has_reason = any(k in r_set for k in {"because", "since", "so that", "due"})
         has_emphasis = "especially" in r_set or "particularly" in r_set
         unique_terms = len([t for t in r_set if t not in q_toks and len(t) > 3])
@@ -228,22 +236,21 @@ class ScoreEngine:
         spec_bonus = (12 if has_reason else 0) + (8 if has_emphasis else 0) + min(22, unique_terms)
         specificity = max(0, min(100, int(spec_base + spec_bonus)))
 
-        # Concreteness
         first_hand_markers = {
-            "i use","i used","i tried","i've used","i have used","i bought","we bought",
-            "my kids use","my kid uses","my children","my family","we use","i saw","i heard","i've seen"
+            "i use", "i used", "i tried", "i've used", "i have used", "i bought", "we bought",
+            "my kids use", "my kid uses", "my children", "my family", "we use", "i saw", "i heard", "i've seen"
         }
         usage_context = {
-            "at home","at work","for work","on the train","on the commute","in the car",
-            "at night","in the morning","on weekends","after school","during football","during ads",
-            "when cooking","when cleaning","while driving","before bed"
+            "at home", "at work", "for work", "on the train", "on the commute", "in the car",
+            "at night", "in the morning", "on weekends", "after school", "during football", "during ads",
+            "when cooking", "when cleaning", "while driving", "before bed"
         }
         feature_sensory = {
-            "logo","pack","packaging","design","music","jingle","voiceover","scene","actor","character","dog",
-            "taste","smell","texture","colour","color","price","offer","discount","durable","battery","speed",
-            "instructions","interface","app","sound","volume","quality","resolution","camera","label","slogan"
+            "logo", "pack", "packaging", "design", "music", "jingle", "voiceover", "scene", "actor", "character", "dog",
+            "taste", "smell", "texture", "colour", "color", "price", "offer", "discount", "durable", "battery", "speed",
+            "instructions", "interface", "app", "sound", "volume", "quality", "resolution", "camera", "label", "slogan"
         }
-        example_markers = {"for example","such as","like when","like the time","e.g.","especially","particularly"}
+        example_markers = {"for example", "such as", "like when", "like the time", "e.g.", "especially", "particularly"}
 
         rt = " " + " ".join(r_toks) + " "
 
@@ -268,14 +275,13 @@ class ScoreEngine:
         )
         concreteness = max(0, min(100, int(conc_score)))
 
-        # Relevance
         rel_overlap = 100 * self._jaccard(q_toks, r_set)
-        opinion_q = any(k in q_toks for k in {"think","opinion","feel","like","dislike","impression","favourite","favorite","rate"})
+        opinion_q = any(k in q_toks for k in {"think", "opinion", "feel", "like", "dislike", "impression", "favourite", "favorite", "rate"})
         subjective_resp = any(k in r_set for k in {
-            "good","bad","great","love","hate","nice","funny","boring","memorable","confusing","clear","useful","annoying",
-            "enjoy","enjoyed","liked","disliked","amazing","awful","meh"
+            "good", "bad", "great", "love", "hate", "nice", "funny", "boring", "memorable", "confusing", "clear", "useful", "annoying",
+            "enjoy", "enjoyed", "liked", "disliked", "amazing", "awful", "meh"
         })
-        refers_to_item = any(k in r_set for k in {"ad","advert","advertisement","commercial","spot","it","this"})
+        refers_to_item = any(k in r_set for k in {"ad", "advert", "advertisement", "commercial", "spot", "it", "this"})
 
         rel_heur = 0
         if opinion_q and subjective_resp:
@@ -284,12 +290,11 @@ class ScoreEngine:
             rel_heur += 15
         relevance = max(0, min(100, int(max(rel_overlap, rel_heur))))
 
-        # Clarity
         sentences = [s for s in r.replace("!", ".").split(".") if s.strip()]
         avg_len = (sum(len(self._tokens(s)) for s in sentences) / len(sentences)) if sentences else wc
         too_long = avg_len > 28
         too_short = avg_len < 3
-        fillers = {"like","basically","sort of","kind of","you know","stuff","things"}
+        fillers = {"like", "basically", "sort of", "kind of", "you know", "stuff", "things"}
         hedge = any(f in " ".join(r_toks) for f in fillers)
         clarity_base = 82
         clarity_pen = (14 if too_long else 0) + (14 if too_short else 0) + (8 if hedge else 0)
@@ -320,8 +325,8 @@ class ScoreEngine:
             base = 10
 
         templ = [
-            "as an ai","as a language model","overall,","moreover,","furthermore,",
-            "in summary","in conclusion","additionally,","importantly,"
+            "as an ai", "as a language model", "overall,", "moreover,", "furthermore,",
+            "in summary", "in conclusion", "additionally,", "importantly,"
         ]
         templ_hits = sum(1 for t in templ if t in r.lower())
 
@@ -338,6 +343,7 @@ class ScoreEngine:
 
         score = base + templ_hits * 22 + low_var + rep + verbose + very_verbose
         return int(max(0, min(100, score)))
+
 
 score_engine = ScoreEngine()
 
@@ -377,7 +383,6 @@ async def _call_openai_chat(messages: list[dict], model: str, max_tokens: int) -
             model=model,
             messages=messages,
             max_completion_tokens=max_tokens,
-            # Keep output single-line-ish for speed/cleanliness
             stop=["\n"],
         )
         return resp.choices[0].message.content.strip()
@@ -396,7 +401,6 @@ async def generate_ack(q: str, r: str, project_id: Optional[str], locale: Option
     text = await _call_openai_chat(messages, model, max_tokens=min(16, MAX_TOKENS))
     ack = text.split("\n")[0][:160]
 
-    # Blocklist check against generated ack; if hit, try once more with avoid list
     if contains_blocked_phrase(ack, project_id):
         avoid = ", ".join(sorted(get_block_phrases(project_id)))
         messages[0]["content"] = SYSTEM_ACK + " " + _locale_instruction(locale) + (f" Avoid these terms: {avoid}" if avoid else "")
@@ -409,7 +413,6 @@ async def generate_ack(q: str, r: str, project_id: Optional[str], locale: Option
 
 
 async def generate_snapback(q: str, r: str, project_id: Optional[str], locale: Optional[str], model: str = DEFAULT_MODEL_SNAPBACK) -> Optional[str]:
-    # Only trigger if poor/irrelevant response (very short or empty)
     if not r or len(r.split()) <= 3:
         messages = [
             {"role": "system", "content": SYSTEM_SNAPBACK + " " + _locale_instruction(locale)},
@@ -423,8 +426,6 @@ async def generate_snapback(q: str, r: str, project_id: Optional[str], locale: O
 
 
 def _fallback_followup(q: str, r: str, locale: Optional[str]) -> str:
-    # Minimal, language-agnostic fallback (kept English on purpose if model fails).
-    # In practice the model should not fail; this is just a safety net.
     rlow = (r or "").lower()
     if len(rlow.split()) <= 3:
         return "Could you share a bit more detail about that?"
@@ -449,11 +450,9 @@ async def generate_followup(
     if not t or t == "?" or len(t.split()) < 6:
         t = _fallback_followup(question, response, locale)
 
-    # Ensure it ends with a question mark
     if not t.endswith("?") and not t.endswith("؟"):
         t = t.rstrip(" .!") + "?"
 
-    # Blocklist on generated follow-up; if hit, retry once with avoid list
     if contains_blocked_phrase(t, project_id):
         avoid = ", ".join(sorted(list(get_block_phrases(project_id))))
         messages2 = [
@@ -471,8 +470,6 @@ async def generate_followup(
 # ---------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------
-from fastapi.middleware.cors import CORSMiddleware
-
 app = FastAPI(title="Verbalytics API", version="2.3.0")
 
 app.add_middleware(
@@ -513,13 +510,11 @@ def health() -> dict:
 async def verbalytics(payload: VerbalyticsInput = Body(...)):
     start = time.time()
 
-    # Blocklist hits on INPUT (question + response)
     input_hits = sorted(set(
         find_blocked_phrases(payload.question, payload.project_id) +
         find_blocked_phrases(payload.response, payload.project_id)
     ))
 
-    # Optional reject mode
     if input_hits and INPUT_BLOCK_MODE == "reject":
         raise HTTPException(status_code=422, detail={"message": "Input contains blocked phrases", "phrases": input_hits})
 
@@ -528,7 +523,6 @@ async def verbalytics(payload: VerbalyticsInput = Body(...)):
     want_ack = "ack" in payload.tasks
     want_follow = "followup" in payload.tasks
 
-    # Fast path: check only (no scoring, no LLM calls)
     if want_check and not want_score and not want_ack and not want_follow:
         latency_ms = int((time.time() - start) * 1000)
         return VerbalyticsOutput(
@@ -542,7 +536,6 @@ async def verbalytics(payload: VerbalyticsInput = Body(...)):
             latency_ms=latency_ms,
         )
 
-    # LLM tasks (parallel)
     snap_task = asyncio.create_task(generate_snapback(payload.question, payload.response, payload.project_id, payload.locale))
     ack_task = asyncio.create_task(generate_ack(payload.question, payload.response, payload.project_id, payload.locale)) if want_ack else None
     follow_task = asyncio.create_task(generate_followup(
@@ -596,7 +589,6 @@ async def verbalytics_stream(payload: VerbalyticsInput = Body(...)):
             find_blocked_phrases(payload.response, payload.project_id)
         ))
 
-        # If check-only, stream just one line and done
         if want_check and not want_score and not want_ack and not want_follow:
             yield JSONResponse(content={
                 "type": "check",
@@ -657,6 +649,7 @@ async def admin_blocklist(project: Optional[str] = None):
             "phrases": sorted(list(phrases)),
         }
 
+
 @app.post("/admin/blocklist/refresh")
 async def admin_blocklist_refresh():
     _refresh_blocklist(True)
@@ -666,21 +659,34 @@ async def admin_blocklist_refresh():
             "version": _block_version,
             "global_count": len(_block_global),
             "projects_map_count": len(_block_projects)
-        
         }
-{
-  "deepdive": {
-    "question_code": "MA1_MANIFESTO_1",
-    "next_question": "...",
-    "action": "repair",
-    "should_continue": True,
-    "is_loop": True
-  }
-}
+
+
 # =========================================================
-# DEEPDIVE MODULE (TEMP ROUTE CHECK)
+# DEEPDIVE MODULE (STAGE 1 STUB)
 # =========================================================
 
+class DeepDiveRequest(BaseModel):
+    project_id: str
+    respondent_id: str
+    question_id: str
+    response: str
+    prior_answers: Optional[Dict[str, float]] = None
+
+
 @app.post("/deepdive")
-async def deepdive_test():
-    return {"ok": True, "route": "deepdive"}
+async def deepdive(req: DeepDiveRequest):
+    return {
+        "route": "test",
+        "decision": {
+            "action": "clarify",
+            "reason": "route_live"
+        },
+        "deepdive": {
+            "question_code": f"{req.question_id}_1",
+            "next_question": "What specifically do you mean by that?",
+            "action": "clarify",
+            "should_continue": True,
+            "is_loop": False
+        }
+    }
