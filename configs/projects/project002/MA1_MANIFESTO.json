@@ -1,82 +1,115 @@
 {
   "project_id": "project002",
   "question_id": "MA1_MANIFESTO",
+  "topic": "Reaction to alternative No7 beauty and make-up campaign",
 
-  "main_question": "What made you give it that score?",
+  "stimulus_context": {
+    "description": "Respondents were shown an alternative No7 campaign intended to communicate the brand promise for its beauty and make-up range.",
+    "shown_text": "Now we want to show you a couple of alternative versions that No7 has put together to sum up their promise for their range of beauty and make up products. Please have a good read through their version."
+  },
 
-  "objective": "Understand why the No7 design does or does not resonate, identifying specific elements that drive appeal or disengagement. If it does resonate with them we want to understand how that impacts them and if it doesn't resonate with them we want to understand why it doesnt, how it impacts them and what changes could be made to make it resonate with them",
+  "question_context": {
+    "main_question": "What made you give it that score? Please be as specific as you can about which elements you find appealing or unappealing.",
+    "question_purpose": "To understand the respondent’s reasoning, feelings, and interpretation of the manifesto in relation to the resonance score they gave."
+  },
 
-  "probe_goal": "Extract clear, specific feedback on what is appealing and unappealing in the manifesto, and ensure alignment between score and reasoning.",
+  "objective": {
+    "primary": "Understand why the manifesto does or does not resonate with the respondent.",
+    "secondary": [
+      "Identify which specific elements feel appealing",
+      "Identify which specific elements feel unappealing",
+      "Understand how the wording, tone, and presentation are being interpreted",
+      "Understand what is driving the score the respondent gave"
+    ]
+  },
 
-  "focus_areas": [
-    "message clarity",
-    "brand promise",
-    "tone and language",
-    "emotional resonance",
-    "credibility",
-    "relevance to respondent",
-    "specific words or phrases",
-    "overall impression"
-  ],
-
-  "avoid_areas": [
-    "generic opinions without reference to the manifesto",
-    "hypothetical scenarios",
-    "overly abstract emotional probing without evidence"
-  ],
-
-  "context_rules": [
-    {
-      "label": "low_score",
-      "description": "Score between 1–4",
-      "condition": {
-        "type": "value_range",
-        "question": "MA1_MANIFESTO_SCORE",
-        "min": 1,
-        "max": 4
-      },
-      "interview_focus": "Understand what is unappealing, unclear, or not resonating, and identify specific weaknesses in the manifesto.",
-      "consistency_rules": {
-        "expected_sentiment": "negative",
-        "enforce_mismatch": true
-      }
+  "context": {
+    "inputs": {
+      "score_source": "MA1_MANIFESTO_SCORE"
     },
-    {
-      "label": "mid_score",
-      "description": "Score between 5–6",
-      "condition": {
-        "type": "value_range",
-        "question": "MA1_MANIFESTO_SCORE",
-        "min": 5,
-        "max": 6
+    "routes": [
+      {
+        "label": "low_score",
+        "range": [1, 4],
+        "focus": "Explore what feels unappealing, unconvincing, unclear, or not resonating."
       },
-      "interview_focus": "Explore both what works and what does not work, identifying trade-offs and mixed perceptions.",
-      "consistency_rules": {
-        "expected_sentiment": "mixed",
-        "enforce_balance": true
+      {
+        "label": "mid_score",
+        "range": [5, 6],
+        "focus": "Explore both what works and what does not, and understand mixed or qualified reactions."
+      },
+      {
+        "label": "high_score",
+        "range": [7, 10],
+        "focus": "Explore what feels appealing, convincing, and resonant."
       }
-    },
-    {
-      "label": "high_score",
-      "description": "Score between 7–10",
-      "condition": {
-        "type": "value_range",
-        "question": "MA1_MANIFESTO_SCORE",
-        "min": 7,
-        "max": 10
-      },
-      "interview_focus": "Understand what is resonating strongly and which elements drive appeal and connection.",
-      "consistency_rules": {
-        "expected_sentiment": "positive",
-        "enforce_mismatch": true
-      }
-    },
-    {
-      "label": "neutral",
-      "condition": {
-        "type": "fallback"
-      },
-      "interview_focus": "Explore both positive and negative reactions and clarify overall perception."
-    }
-  ]
+    ],
+    "fallback_route": "neutral"
+  },
+
+  "probe_priorities": {
+    "seek": [
+      "specific words or phrases",
+      "specific aspects of tone or language",
+      "specific elements of presentation or design where relevant",
+      "how the message is being interpreted",
+      "why it feels appealing or unappealing",
+      "how personally relevant it feels",
+      "what is driving the resonance score"
+    ],
+    "avoid": [
+      "generic follow-up prompts with no anchor",
+      "fact-checking or treating the response as right or wrong",
+      "trying to catch the respondent out",
+      "overly abstract probing that is not tied back to the manifesto or the question"
+    ]
+  },
+
+  "specificity_targets": {
+    "language": [
+      "Which words or phrases stood out to you?",
+      "Was there any wording that particularly worked or didn’t work for you?",
+      "Were there any parts of the wording that felt especially strong, weak, clear, or off?"
+    ],
+    "visuals": [
+      "Was there anything in the look, layout, or presentation that stood out to you?",
+      "Did any visual or design elements affect how you felt about it?"
+    ],
+    "meaning": [
+      "What did it suggest or imply to you?",
+      "What about it felt right or not quite right?",
+      "How did you interpret what No7 was trying to say?"
+    ],
+    "personal_relevance": [
+      "Why did that feel relevant or not relevant to you personally?",
+      "What made it connect or not connect with you?",
+      "Did it feel like it was speaking to someone like you? Why or why not?"
+    ]
+  },
+
+  "completion": {
+    "principle": "Continue probing until the respondent’s thinking and feeling are clearly understood and sufficiently explored, not just until one specific point is identified.",
+    "minimum_requirements": [
+      "The respondent has explained what they think",
+      "The respondent has explained why they think it",
+      "At least one concrete example, word, phrase, or identifiable element has been discussed"
+    ],
+    "depth_expectations": [
+      "More than one aspect should be explored where relevant",
+      "The reasoning should feel developed rather than partial",
+      "The answer should move beyond surface opinion where possible"
+    ],
+    "stop_when": [
+      "The respondent’s view is clear and well articulated",
+      "The main drivers of their score have been uncovered",
+      "Further probing is not adding meaningful new understanding"
+    ],
+    "continue_when": [
+      "The answer is still vague or generic",
+      "Only one narrow point has been explored and other relevant angles remain",
+      "The respondent’s reasoning is still unclear",
+      "There is clear room to deepen specificity or interpretation"
+    ],
+    "max_turns": 3
+  }
 }
