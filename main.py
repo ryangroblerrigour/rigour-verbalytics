@@ -784,12 +784,12 @@ def generate_repair_question(previous_question: str, bad_response: str) -> str:
 
     if r.isdigit():
         return (
-            f"You entered '{r}', but could you answer in words and relate it to the question: "
+            f"Could you explain what you mean by '{r}' in relation to: "
             f"{previous_question}"
         )
 
     return (
-        f"Could you help me answer this in relation to the question: "
+        f"Could you expand a bit more on that in relation to: "
         f"{previous_question}"
     )
 
