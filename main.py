@@ -663,7 +663,7 @@ async def admin_blocklist_refresh():
 
 
 # =========================================================
-# DEEPDIVE MODULE (STAGE 2 - ROUTE + CONFIG)
+# DEEPDIVE MODULE (STAGE 3 - ROUTE + RESPONSE AWARE)
 # =========================================================
 
 SESSIONS = {}
@@ -725,6 +725,75 @@ def evaluate_route(config, prior_answers):
     }
 
 
+def evaluate_response_veronica(response: str):
+    rl = (response or "").lower().strip()
+
+    return {
+        "mentions_language": any(
+            x in rl for x in [
+                "tone", "word", "words", "phrase", "phrases",
+                "wording", "language", "message", "line"
+            ]
+        ),
+        "mentions_visuals": any(
+            x in rl for x in [
+                "colour", "color", "visual", "visuals",
+                "design", "layout", "look", "font", "image", "images"
+            ]
+        ),
+        "mentions_meaning": any(
+            x in rl for x in [
+                "meaning", "means", "suggests", "implies",
+                "comes across", "feels", "felt"
+            ]
+        ),
+        "mentions_relevance": any(
+            x in rl for x in [
+                "for me", "to me", "personally", "relevant",
+                "connect", "doesn't connect", "doesnt connect"
+            ]
+        ),
+        "is_vague": len(rl.split()) < 5
+    }
+
+
+def is_invalid_response(response: str) -> bool:
+    r = (response or "").strip()
+    rl = r.lower()
+
+    if not r:
+        return True
+
+    if r.isdigit():
+        return True
+
+    invalid_short = {
+        "ok", "yes", "no", "maybe", "idk", "don't know", "dont know", "not sure", "nothing"
+    }
+    if rl in invalid_short:
+        return True
+
+    if len(r.split()) <= 1:
+        return True
+
+    return False
+
+
+def generate_repair_question(previous_question: str, bad_response: str) -> str:
+    r = (bad_response or "").strip()
+
+    if r.isdigit():
+        return (
+            f"You entered '{r}', but could you answer in words and relate it to the question: "
+            f"{previous_question}"
+        )
+
+    return (
+        f"Could you help me answer this in relation to the question: "
+        f"{previous_question}"
+    )
+
+
 @app.post("/deepdive")
 async def deepdive(req: DeepDiveRequest):
     try:
@@ -737,39 +806,137 @@ async def deepdive(req: DeepDiveRequest):
         if session_key not in SESSIONS:
             SESSIONS[session_key] = {
                 "history": [],
-                "turn_count": 0
+                "turn_count": 0,
+                "repair_count": 0,
+                "current_question_code": None,
+                "current_question_text": None
             }
 
         session = SESSIONS[session_key]
-        session["history"].append({"role": "user", "text": req.response})
 
         config = load_question_config(req.project_id, req.question_id)
         route = evaluate_route(config, req.prior_answers or {})
+        route_label = route.get("label", "neutral")
+
+        # Store respondent answer
+        session["history"].append({"role": "user", "text": req.response})
+
+        # -------------------------------------------------
+        # LOOP / REPAIR
+        # -------------------------------------------------
+        if is_invalid_response(req.response):
+            session["repair_count"] += 1
+
+            if session["repair_count"] >= 3:
+                return {
+                    "route": route_label,
+                    "decision": {
+                        "action": "stop",
+                        "reason": "repair_exhausted"
+                    },
+                    "deepdive": {
+                        "should_continue": False,
+                        "stop_reason": "repair_exhausted"
+                    }
+                }
+
+            previous_question = (
+                session.get("current_question_text")
+                or config.get("question_context", {}).get("main_question", "Please answer in words.")
+            )
+            question_code = session.get("current_question_code") or f"{req.question_id}_1"
+            repair_question = generate_repair_question(previous_question, req.response)
+
+            session["history"].append({"role": "assistant", "text": repair_question})
+
+            return {
+                "route": route_label,
+                "decision": {
+                    "action": "repair",
+                    "reason": "invalid_response_same_turn"
+                },
+                "deepdive": {
+                    "question_code": question_code,
+                    "next_question": repair_question,
+                    "action": "repair",
+                    "should_continue": True,
+                    "is_loop": True
+                }
+            }
+
+        # Valid answer, reset repair count
+        session["repair_count"] = 0
+
+        evaluation = evaluate_response_veronica(req.response)
 
         question_code = f"{req.question_id}_{session['turn_count'] + 1}"
 
-        # still simple for now, but route-aware
-        if route["label"] == "low_score":
-            next_question = "What specifically about it didn’t work for you?"
-            action = "ask_specifics"
-        elif route["label"] == "mid_score":
-            next_question = "What worked for you, and what didn’t?"
-            action = "explore_both_sides"
-        elif route["label"] == "high_score":
-            next_question = "What specifically made it resonate with you?"
-            action = "ask_specifics"
-        else:
-            next_question = "What specifically do you mean by that?"
-            action = "clarify"
+        # -------------------------------------------------
+        # ROUTE + RESPONSE-AWARE QUESTION SELECTION
+        # -------------------------------------------------
+        if route_label == "low_score":
+            if evaluation["mentions_language"]:
+                next_question = "What specifically about the tone or wording didn’t work for you?"
+                action = "ask_specific_words"
+            elif evaluation["mentions_visuals"]:
+                next_question = "What specifically about the visuals or design didn’t work for you?"
+                action = "ask_specific_visuals"
+            elif evaluation["mentions_meaning"]:
+                next_question = "What about the message or meaning didn’t feel right to you?"
+                action = "ask_meaning"
+            else:
+                next_question = "What specifically about it didn’t work for you?"
+                action = "ask_specifics"
 
+        elif route_label == "mid_score":
+            if evaluation["mentions_language"]:
+                next_question = "What about the wording worked for you, and what didn’t?"
+                action = "explore_both_sides"
+            elif evaluation["mentions_visuals"]:
+                next_question = "What about the visuals or design worked for you, and what didn’t?"
+                action = "explore_both_sides"
+            else:
+                next_question = "What worked for you, and what didn’t?"
+                action = "explore_both_sides"
+
+        elif route_label == "high_score":
+            if evaluation["mentions_language"]:
+                next_question = "What specifically about the wording or tone resonated with you?"
+                action = "ask_specific_words"
+            elif evaluation["mentions_visuals"]:
+                next_question = "What specifically about the visuals or design resonated with you?"
+                action = "ask_specific_visuals"
+            elif evaluation["mentions_meaning"]:
+                next_question = "What about the message or meaning connected with you?"
+                action = "ask_meaning"
+            else:
+                next_question = "What specifically made it resonate with you?"
+                action = "ask_specifics"
+
+        else:
+            if evaluation["mentions_language"]:
+                next_question = "What specifically about the wording or tone stood out to you?"
+                action = "ask_specific_words"
+            elif evaluation["mentions_visuals"]:
+                next_question = "What specifically about the visuals or design stood out to you?"
+                action = "ask_specific_visuals"
+            elif evaluation["mentions_meaning"]:
+                next_question = "What about the message or meaning stood out to you?"
+                action = "ask_meaning"
+            else:
+                next_question = "What specifically do you mean by that?"
+                action = "clarify"
+
+        session["current_question_code"] = question_code
+        session["current_question_text"] = next_question
         session["history"].append({"role": "assistant", "text": next_question})
         session["turn_count"] += 1
 
         return {
-            "route": route["label"],
+            "route": route_label,
             "decision": {
                 "action": action,
-                "reason": "route_selected"
+                "reason": "route_and_response_selected"
             },
             "deepdive": {
                 "question_code": question_code,
