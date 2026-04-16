@@ -675,7 +675,7 @@ async def admin_blocklist_refresh():
     "question_code": "MA1_MANIFESTO_1",
     "next_question": "...",
     "action": "repair",
-    "should_continue": true,
+    "should_continue": True,
     "is_loop": true
   }
 }
