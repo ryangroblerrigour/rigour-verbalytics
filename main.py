@@ -763,7 +763,6 @@ def is_invalid_response(response: str) -> bool:
 
     if not r:
         return True
-
     if r.isdigit():
         return True
 
@@ -783,15 +782,49 @@ def generate_repair_question(previous_question: str, bad_response: str) -> str:
     r = (bad_response or "").strip()
 
     if r.isdigit():
-        return (
-            f"Could you explain what you mean by '{r}' in relation to: "
-            f"{previous_question}"
-        )
+        return f"Could you explain what you mean by '{r}' in relation to: {previous_question}"
 
-    return (
-        f"Could you expand a bit more on that in relation to: "
-        f"{previous_question}"
-    )
+    return f"Could you expand a bit more on that in relation to: {previous_question}"
+
+
+def choose_next_question(route_label: str, evaluation: dict):
+    if route_label == "low_score":
+        if evaluation["mentions_language"]:
+            return "What specifically about the tone or wording didn’t work for you?", "ask_specific_words"
+        elif evaluation["mentions_visuals"]:
+            return "What specifically about the visuals or design didn’t work for you?", "ask_specific_visuals"
+        elif evaluation["mentions_meaning"]:
+            return "What about the message or meaning didn’t feel right to you?", "ask_meaning"
+        else:
+            return "What specifically about it didn’t work for you?", "ask_specifics"
+
+    elif route_label == "mid_score":
+        if evaluation["mentions_language"]:
+            return "What about the wording worked for you, and what didn’t?", "explore_both_sides"
+        elif evaluation["mentions_visuals"]:
+            return "What about the visuals or design worked for you, and what didn’t?", "explore_both_sides"
+        else:
+            return "What worked for you, and what didn’t?", "explore_both_sides"
+
+    elif route_label == "high_score":
+        if evaluation["mentions_language"]:
+            return "What specifically about the wording or tone resonated with you?", "ask_specific_words"
+        elif evaluation["mentions_visuals"]:
+            return "What specifically about the visuals or design resonated with you?", "ask_specific_visuals"
+        elif evaluation["mentions_meaning"]:
+            return "What about the message or meaning connected with you?", "ask_meaning"
+        else:
+            return "What specifically made it resonate with you?", "ask_specifics"
+
+    else:
+        if evaluation["mentions_language"]:
+            return "What specifically about the wording or tone stood out to you?", "ask_specific_words"
+        elif evaluation["mentions_visuals"]:
+            return "What specifically about the visuals or design stood out to you?", "ask_specific_visuals"
+        elif evaluation["mentions_meaning"]:
+            return "What about the message or meaning stood out to you?", "ask_meaning"
+        else:
+            return "What specifically do you mean by that?", "clarify"
 
 
 @app.post("/deepdive")
@@ -809,7 +842,8 @@ async def deepdive(req: DeepDiveRequest):
                 "turn_count": 0,
                 "repair_count": 0,
                 "current_question_code": None,
-                "current_question_text": None
+                "current_question_text": None,
+                "last_valid_question_text": None
             }
 
         session = SESSIONS[session_key]
@@ -842,12 +876,15 @@ async def deepdive(req: DeepDiveRequest):
 
             previous_question = (
                 session.get("current_question_text")
+                or session.get("last_valid_question_text")
                 or config.get("question_context", {}).get("main_question", "Please answer in words.")
             )
+
             question_code = session.get("current_question_code") or f"{req.question_id}_1"
             repair_question = generate_repair_question(previous_question, req.response)
 
             session["history"].append({"role": "assistant", "text": repair_question})
+            session["current_question_text"] = previous_question  # keep anchor stable during loop
 
             return {
                 "route": route_label,
@@ -868,67 +905,13 @@ async def deepdive(req: DeepDiveRequest):
         session["repair_count"] = 0
 
         evaluation = evaluate_response_veronica(req.response)
-
         question_code = f"{req.question_id}_{session['turn_count'] + 1}"
 
-        # -------------------------------------------------
-        # ROUTE + RESPONSE-AWARE QUESTION SELECTION
-        # -------------------------------------------------
-        if route_label == "low_score":
-            if evaluation["mentions_language"]:
-                next_question = "What specifically about the tone or wording didn’t work for you?"
-                action = "ask_specific_words"
-            elif evaluation["mentions_visuals"]:
-                next_question = "What specifically about the visuals or design didn’t work for you?"
-                action = "ask_specific_visuals"
-            elif evaluation["mentions_meaning"]:
-                next_question = "What about the message or meaning didn’t feel right to you?"
-                action = "ask_meaning"
-            else:
-                next_question = "What specifically about it didn’t work for you?"
-                action = "ask_specifics"
-
-        elif route_label == "mid_score":
-            if evaluation["mentions_language"]:
-                next_question = "What about the wording worked for you, and what didn’t?"
-                action = "explore_both_sides"
-            elif evaluation["mentions_visuals"]:
-                next_question = "What about the visuals or design worked for you, and what didn’t?"
-                action = "explore_both_sides"
-            else:
-                next_question = "What worked for you, and what didn’t?"
-                action = "explore_both_sides"
-
-        elif route_label == "high_score":
-            if evaluation["mentions_language"]:
-                next_question = "What specifically about the wording or tone resonated with you?"
-                action = "ask_specific_words"
-            elif evaluation["mentions_visuals"]:
-                next_question = "What specifically about the visuals or design resonated with you?"
-                action = "ask_specific_visuals"
-            elif evaluation["mentions_meaning"]:
-                next_question = "What about the message or meaning connected with you?"
-                action = "ask_meaning"
-            else:
-                next_question = "What specifically made it resonate with you?"
-                action = "ask_specifics"
-
-        else:
-            if evaluation["mentions_language"]:
-                next_question = "What specifically about the wording or tone stood out to you?"
-                action = "ask_specific_words"
-            elif evaluation["mentions_visuals"]:
-                next_question = "What specifically about the visuals or design stood out to you?"
-                action = "ask_specific_visuals"
-            elif evaluation["mentions_meaning"]:
-                next_question = "What about the message or meaning stood out to you?"
-                action = "ask_meaning"
-            else:
-                next_question = "What specifically do you mean by that?"
-                action = "clarify"
+        next_question, action = choose_next_question(route_label, evaluation)
 
         session["current_question_code"] = question_code
         session["current_question_text"] = next_question
+        session["last_valid_question_text"] = next_question
         session["history"].append({"role": "assistant", "text": next_question})
         session["turn_count"] += 1
 
