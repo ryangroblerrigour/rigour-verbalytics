@@ -671,7 +671,7 @@ async def admin_blocklist_refresh():
         
         }
 # =========================================================
-# DEEPDIVE MODULE (CONSISTENCY + IMPROVEMENT LOGIC)
+# DEEPDIVE MODULE (VERONICA V1)
 # =========================================================
 
 SESSIONS = {}
@@ -705,254 +705,361 @@ def load_question_config(project_id, question_id):
         return json.load(f)
 
 
-def evaluate_context_rules(config, prior_answers):
-    for rule in config.get("context_rules", []):
-        cond = rule.get("condition", {})
-        cond_type = cond.get("type")
+# ---------------------------------------------------------
+# Route evaluation from new config schema
+# ---------------------------------------------------------
+def evaluate_route(config, prior_answers):
+    context = config.get("context", {})
+    inputs = context.get("inputs", {})
+    score_source = inputs.get("score_source")
+    routes = context.get("routes", [])
+    fallback_route = context.get("fallback_route", "neutral")
 
-        if cond_type == "value_range":
-            q = cond.get("question")
-            val = prior_answers.get(q)
+    score_val = None
+    if score_source:
+        score_val = prior_answers.get(score_source)
 
-            if val is None:
+    if score_val is not None:
+        for route in routes:
+            rng = route.get("range")
+            if not rng or len(rng) != 2:
                 continue
-
-            min_val = cond.get("min")
-            max_val = cond.get("max")
-
-            if min_val <= val <= max_val:
-                return rule
-
-        elif cond_type == "fallback":
-            return rule
+            if rng[0] <= score_val <= rng[1]:
+                return {
+                    "label": route.get("label", fallback_route),
+                    "focus": route.get("focus", "")
+                }
 
     return {
-        "label": "neutral",
-        "interview_focus": "Explore the response in depth."
+        "label": fallback_route,
+        "focus": "Explore the respondent's answer in depth and clarify what they mean."
     }
 
 
-# ----------------------------
-# Response evaluation
-# ----------------------------
-def evaluate_response_simple(response, history):
-    r = (response or "").lower().strip()
+# ---------------------------------------------------------
+# Simple Veronica-style response evaluation
+# ---------------------------------------------------------
+def evaluate_response_veronica(response, history):
+    r = (response or "").strip()
+    rl = r.lower()
+
+    words = rl.split()
+
+    dont_know_phrases = {
+        "don't know", "dont know", "not sure", "idk", "no idea", "nothing really", "nothing"
+    }
+    exhausted_phrases = {
+        "that's it", "thats it", "nothing else", "not much else", "no more", "already said"
+    }
+
+    positive_markers = [
+        "like", "love", "good", "great", "clear", "strong", "appealing",
+        "resonates", "connects", "nice", "relevant"
+    ]
+    negative_markers = [
+        "don't like", "dont like", "dislike", "bad", "weak", "unclear",
+        "confusing", "generic", "boring", "off", "poor", "doesn't", "doesnt"
+    ]
+
+    language_markers = [
+        "word", "words", "phrase", "phrases", "wording", "tone", "language", "message", "line"
+    ]
+    visual_markers = [
+        "colour", "colors", "color", "visual", "visuals", "design", "layout", "look", "font", "image"
+    ]
+    meaning_markers = [
+        "means", "meaning", "suggests", "implies", "comes across", "feels", "felt", "says"
+    ]
+    relevance_markers = [
+        "for me", "to me", "personally", "relevant", "not relevant", "connect", "doesn't connect",
+        "doesnt connect", "someone like me"
+    ]
+    reason_markers = [
+        "because", "makes me", "made me", "so it", "which means", "that makes", "why"
+    ]
+    example_markers = [
+        "for example", "like when", "when", "for instance"
+    ]
+
+    quoted_phrase = "'" in r or '"' in r
+
+    has_positive = any(p in rl for p in positive_markers)
+    has_negative = any(p in rl for p in negative_markers)
+
+    if has_positive and has_negative:
+        sentiment = "mixed"
+    elif has_negative:
+        sentiment = "negative"
+    elif has_positive:
+        sentiment = "positive"
+    else:
+        sentiment = "neutral"
+
+    mentions_language = any(m in rl for m in language_markers)
+    mentions_visuals = any(m in rl for m in visual_markers)
+    mentions_meaning = any(m in rl for m in meaning_markers)
+    mentions_relevance = any(m in rl for m in relevance_markers)
+
+    has_reason = any(m in rl for m in reason_markers)
+    has_example = any(m in rl for m in example_markers) or quoted_phrase
+    is_vague = len(words) < 5
+    is_specific = len(words) >= 7 or quoted_phrase
+    is_dont_know = rl in dont_know_phrases
+    is_exhausted = any(p in rl for p in exhausted_phrases)
+
+    prior_user_texts = [h["text"].strip().lower() for h in history if h["role"] == "user"]
+    is_repetitive = prior_user_texts.count(rl) > 1
 
     return {
-        "is_dont_know": r in ["dont know", "don't know", "not sure", "idk"],
-        "is_vague": len(r.split()) < 5,
-        "has_reason": "because" in r,
-        "has_example": any(x in r for x in ["when", "for example", "like when"]),
-        "is_specific": len(r.split()) > 6,
-        "is_repetitive": any(h["text"].lower() == r for h in history if h["role"] == "user")
+        "is_dont_know": is_dont_know,
+        "is_vague": is_vague,
+        "is_specific": is_specific,
+        "has_reason": has_reason,
+        "has_example": has_example,
+        "is_repetitive": is_repetitive,
+        "is_exhausted": is_exhausted,
+        "sentiment": sentiment,
+        "mentions_language": mentions_language,
+        "mentions_visuals": mentions_visuals,
+        "mentions_meaning": mentions_meaning,
+        "mentions_relevance": mentions_relevance,
+        "quoted_phrase": quoted_phrase
     }
 
 
-# ----------------------------
-# Sentiment detection
-# IMPORTANT:
-# Return explicit polarity only when the respondent
-# actually expresses polarity.
-# ----------------------------
-def detect_sentiment(response: str):
-    r = (response or "").lower().strip()
+# ---------------------------------------------------------
+# Aggregate what Veronica has learned across the session
+# ---------------------------------------------------------
+def summarise_session_learning(history):
+    user_text = " ".join([h["text"] for h in history if h["role"] == "user"]).lower()
 
-    negative_phrases = [
-        "don't like", "dont like", "do not like",
-        "dislike", "hate", "not good", "not clear",
-        "doesn't make sense", "doesnt make sense",
-        "confusing", "unclear", "boring", "weak", "bad"
-    ]
-    for p in negative_phrases:
-        if p in r:
-            return "negative"
+    learned = {
+        "has_specifics": False,
+        "has_reasoning": False,
+        "has_language_detail": False,
+        "has_visual_detail": False,
+        "has_meaning": False,
+        "has_relevance": False,
+        "positive_present": False,
+        "negative_present": False
+    }
 
-    positive_phrases = [
-        "i like", "like it", "love", "really like",
-        "very good", "appealing", "clear", "strong", "great", "nice"
-    ]
-    for p in positive_phrases:
-        if p in r:
-            return "positive"
+    if len(user_text.split()) >= 12 or "'" in user_text or '"' in user_text:
+        learned["has_specifics"] = True
 
-    return "neutral"
+    if any(x in user_text for x in ["because", "makes me", "made me", "which means", "suggests", "implies"]):
+        learned["has_reasoning"] = True
 
+    if any(x in user_text for x in ["word", "words", "phrase", "phrases", "wording", "tone", "language", "message"]):
+        learned["has_language_detail"] = True
 
-# ----------------------------
-# Use prior user sentiment if current answer is
-# a short fragment with no explicit polarity.
-# Example:
-# user 1: "I liked the aesthetic" -> positive
-# user 2: "the overall message" -> inherit positive
-# ----------------------------
-def infer_effective_sentiment(latest_response: str, history, context_label: str):
-    current = detect_sentiment(latest_response)
+    if any(x in user_text for x in ["colour", "color", "visual", "visuals", "design", "layout", "look", "font"]):
+        learned["has_visual_detail"] = True
 
-    if current != "neutral":
-        return current
+    if any(x in user_text for x in ["means", "meaning", "suggests", "implies", "comes across", "feels"]):
+        learned["has_meaning"] = True
 
-    latest_words = len((latest_response or "").split())
-    if latest_words <= 5:
-        prior_user_turns = [h for h in history if h["role"] == "user" and h["text"] != latest_response]
-        for prev in reversed(prior_user_turns):
-            prev_sentiment = detect_sentiment(prev["text"])
-            if prev_sentiment != "neutral":
-                return prev_sentiment
+    if any(x in user_text for x in ["for me", "to me", "personally", "relevant", "connect", "someone like me"]):
+        learned["has_relevance"] = True
 
-    # If still neutral, do not force contradiction.
-    # We keep neutral as neutral.
-    return "neutral"
+    if any(x in user_text for x in ["like", "love", "good", "great", "appealing", "resonates", "nice"]):
+        learned["positive_present"] = True
+
+    if any(x in user_text for x in ["don't like", "dont like", "bad", "weak", "unclear", "confusing", "generic", "off", "poor"]):
+        learned["negative_present"] = True
+
+    return learned
 
 
-# ----------------------------
-# Consistency logic
-# IMPORTANT:
-# Only explicit opposite sentiment = contradiction.
-# Neutral fragments do NOT count as mismatch.
-# ----------------------------
-def evaluate_consistency(consistency_rules, sentiment):
+# ---------------------------------------------------------
+# Decide Veronica's next action
+# ---------------------------------------------------------
+def decide_next_action(evaluation, session, config, route):
+    learned = summarise_session_learning(session["history"])
+    route_label = route.get("label", "neutral")
+    max_turns = config.get("completion", {}).get("max_turns", 3)
 
-    if not consistency_rules:
-        return {"status": "none"}
+    # Hard stops handled in endpoint, but keep stop available here too
+    if session["turn_count"] >= max_turns:
+        return {"action": "stop", "reason": "max_turns_reached"}
 
-    expected = consistency_rules.get("expected_sentiment")
+    # If respondent is clearly exhausted and we have substance, stop
+    if evaluation["is_exhausted"] and learned["has_specifics"] and learned["has_reasoning"]:
+        return {"action": "stop", "reason": "respondent_exhausted"}
 
-    if expected == "mixed":
-        if sentiment in ["positive", "negative"]:
-            return {
-                "status": "missing_side",
-                "instruction": "Response is one-sided. Ask for the missing perspective."
-            }
-        return {"status": "aligned"}
+    # If they are repeating themselves and we already have meaningful detail, stop
+    if evaluation["is_repetitive"] and learned["has_specifics"] and learned["has_reasoning"]:
+        return {"action": "stop", "reason": "diminishing_returns"}
 
-    if expected == "positive":
-        if sentiment == "negative":
-            return {
-                "status": "mismatch",
-                "instruction": "The score is positive but the explanation sounds negative. Gently resolve that tension."
-            }
-        return {"status": "aligned"}
-
-    if expected == "negative":
-        if sentiment == "positive":
-            return {
-                "status": "mismatch",
-                "instruction": "The score is low but the explanation sounds positive. Gently resolve that tension."
-            }
-        return {"status": "aligned"}
-
-    return {"status": "aligned"}
-
-
-# ----------------------------
-# Probe selection
-# ----------------------------
-def select_probe_type(evaluation, context_label, turn_count, sentiment):
-    # High score: after one positive answer, move toward optimisation
-    if context_label == "high_score" and turn_count >= 1 and sentiment in ["positive", "neutral"]:
-        return "improvement"
-
-    # Low score: after one negative answer, move toward specifics
-    if context_label == "low_score" and turn_count >= 1 and sentiment in ["negative", "neutral"]:
-        return "concretising"
-
+    # Start with clarity if vague
     if evaluation["is_vague"]:
-        return "clarification"
+        return {"action": "clarify", "reason": "response_is_vague"}
 
-    if evaluation["has_example"] and not evaluation["has_reason"]:
-        return "impact"
+    # Push toward specifics first
+    if not evaluation["is_specific"]:
+        return {"action": "ask_specifics", "reason": "needs_more_specificity"}
 
-    if evaluation["has_reason"] and not evaluation["has_example"]:
-        return "concretising"
+    # If they mention wording/tone/message but not enough detail, ask for specific words
+    if evaluation["mentions_language"] and not evaluation["quoted_phrase"]:
+        return {"action": "ask_specific_words", "reason": "language_needs_grounding"}
 
-    if evaluation["has_reason"] and evaluation["has_example"]:
-        return "stop_candidate"
+    # If they mention visuals/design but not enough detail, ask for specific visual elements
+    if evaluation["mentions_visuals"] and not evaluation["has_example"]:
+        return {"action": "ask_specific_visuals", "reason": "visual_feedback_needs_grounding"}
 
-    return "laddering"
+    # If they have specifics but not interpretation, ask meaning
+    if evaluation["is_specific"] and not evaluation["mentions_meaning"] and not evaluation["has_reason"]:
+        return {"action": "ask_meaning", "reason": "need_interpretation"}
+
+    # If they have meaning but not personal relevance, optionally deepen into relevance
+    if (evaluation["mentions_meaning"] or evaluation["has_reason"]) and not learned["has_relevance"] and session["turn_count"] < 2:
+        return {"action": "ask_relevance", "reason": "need_personal_connection"}
+
+    # Mid scores should try to explore both sides if only one side has appeared
+    if route_label == "mid_score":
+        if learned["positive_present"] and not learned["negative_present"]:
+            return {"action": "explore_missing_negative", "reason": "mid_score_missing_negative_side"}
+        if learned["negative_present"] and not learned["positive_present"]:
+            return {"action": "explore_missing_positive", "reason": "mid_score_missing_positive_side"}
+
+    # If route is low/high and we only have one narrow angle, broaden slightly
+    if session["turn_count"] < 2 and learned["has_specifics"] and not (learned["has_language_detail"] or learned["has_visual_detail"]):
+        return {"action": "explore_additional_angle", "reason": "only_one_angle_explored"}
+
+    # If we already have specificity + reasoning and at least 2 turns, stop
+    if session["turn_count"] >= 2 and learned["has_specifics"] and learned["has_reasoning"]:
+        return {"action": "stop", "reason": "sufficient_exploration"}
+
+    # Default: deepen reasoning
+    return {"action": "deepen_reason", "reason": "default_deepen"}
 
 
-# ----------------------------
-# LLM Question Generator
-# ----------------------------
-async def generate_deepdive_question(
-    objective,
-    context_label,
-    interview_focus,
+# ---------------------------------------------------------
+# Generate Veronica's question via LLM
+# ---------------------------------------------------------
+async def generate_veronica_question(
+    config,
+    route,
     history,
     latest_response,
-    probe_type,
-    consistency_instruction=None
+    action
 ):
+    objective = config.get("objective", {})
+    primary_objective = objective.get("primary", "")
+    secondary_objectives = objective.get("secondary", [])
+    secondary_text = "; ".join(secondary_objectives)
+
+    topic = config.get("topic", "")
+    question_context = config.get("question_context", {})
+    main_question = question_context.get("main_question", "")
+    question_purpose = question_context.get("question_purpose", "")
+
+    route_label = route.get("label", "neutral")
+    route_focus = route.get("focus", "")
+
+    probe_priorities = config.get("probe_priorities", {})
+    seek = "; ".join(probe_priorities.get("seek", []))
+    avoid = "; ".join(probe_priorities.get("avoid", []))
+
+    specificity_targets = config.get("specificity_targets", {})
+    language_targets = "; ".join(specificity_targets.get("language", []))
+    visual_targets = "; ".join(specificity_targets.get("visuals", []))
+    meaning_targets = "; ".join(specificity_targets.get("meaning", []))
+    relevance_targets = "; ".join(specificity_targets.get("personal_relevance", []))
 
     messages = [
         {
             "role": "system",
             "content": f"""
-You are a skilled qualitative researcher.
+You are Veronica, a qualitative researcher.
 
-Objective:
-{objective}
+Your job is to explore how and why the respondent thinks and feels about the topic.
+Assume the respondent is answering in good faith.
+Do not judge, agree, disagree, fact-check, or try to catch them out.
+Be curious, neutral, and specific.
 
-Context:
-{context_label}
+Topic:
+{topic}
 
-Focus:
-{interview_focus}
+Main question:
+{main_question}
 
-Consistency instruction:
-{consistency_instruction or "None"}
+Question purpose:
+{question_purpose}
 
-Ask ONE follow-up question.
+Primary objective:
+{primary_objective}
+
+Secondary objectives:
+{secondary_text}
+
+Current route:
+{route_label}
+
+Route focus:
+{route_focus}
+
+Probe priorities - seek:
+{seek}
+
+Probe priorities - avoid:
+{avoid}
+
+Specificity guidance:
+- language: {language_targets}
+- visuals: {visual_targets}
+- meaning: {meaning_targets}
+- personal relevance: {relevance_targets}
+
+Current action:
+{action}
+
+Action guidance:
+- clarify -> clarify what they mean in a more grounded way
+- ask_specifics -> ask for concrete parts, elements, or specifics
+- ask_specific_words -> ask which words, phrases, or parts of the wording stood out
+- ask_specific_visuals -> ask which visual or design elements stood out
+- ask_meaning -> ask what it suggests, implies, or says to them
+- ask_relevance -> ask why it feels relevant or not relevant to them personally
+- deepen_reason -> ask why that matters or why they feel that way
+- explore_additional_angle -> gently explore another relevant aspect
+- explore_missing_positive -> gently ask what, if anything, worked better or felt more positive
+- explore_missing_negative -> gently ask what, if anything, did not work or felt less convincing
+- stop -> do not ask anything further
 
 Rules:
-- One question only
-- Max 20 words
+- Ask ONE question only
+- Max 22 words
 - Be natural and conversational
-- No repetition
-- No generic questions like "tell me more"
-- Do not invent contradictions
-- Do not compare two ideas unless the respondent has clearly contrasted them
-- If the respondent gives a short fragment, treat it as an extension of their prior answer
-
-Probe type guidance:
-- clarification -> clarify vague answers
-- concretising -> ask what specifically they mean
-- laddering -> ask why it matters
-- impact -> ask about consequence
-- contradiction -> gently resolve a true mismatch
-- balance -> ask for the missing positive or negative side
-- improvement -> ask what would make it resonate even more
-
-For high scores, improvement questions are often best phrased as:
-- What could make this resonate even more?
-- How could this be strengthened further?
-- What could be updated to make it more compelling?
-
+- Anchor the question to what the respondent just said
+- Avoid generic prompts like "tell me more"
+- Prefer specific questions over abstract ones
+- Do not invent tension or contradiction
+- If the respondent mentions tone, wording, or message, prefer asking about specific words or phrases
+- If the respondent mentions visuals, prefer asking about specific visual elements
 Return only the question.
 """
         },
         {
             "role": "user",
             "content": f"""
-Conversation:
+Conversation so far:
 {history}
 
 Latest response:
 {latest_response}
 
-Probe type: {probe_type}
-
-Ask the next best question.
+Write Veronica's next question for the action: {action}
 """
         }
     ]
 
-    return await _call_openai_chat(messages, DEFAULT_MODEL_FOLLOWUP, 40)
+    return await _call_openai_chat(messages, DEFAULT_MODEL_FOLLOWUP, 48)
 
 
-# ----------------------------
+# ---------------------------------------------------------
 # Endpoint
-# ----------------------------
+# ---------------------------------------------------------
 @app.post("/deepdive")
 async def deepdive(req: DeepDiveRequest):
 
@@ -967,116 +1074,78 @@ async def deepdive(req: DeepDiveRequest):
             SESSIONS[session_key] = {
                 "history": [],
                 "turn_count": 0,
-                "dont_know_streak": 0
+                "dont_know_streak": 0,
+                "action_history": []
             }
 
         session = SESSIONS[session_key]
-
         session["history"].append({"role": "user", "text": req.response})
 
         config = load_question_config(req.project_id, req.question_id)
+        route = evaluate_route(config, req.prior_answers or {})
+        route_label = route.get("label", "neutral")
 
-        context_rule = evaluate_context_rules(
-            config,
-            req.prior_answers or {}
-        )
+        evaluation = evaluate_response_veronica(req.response, session["history"])
 
-        context_label = context_rule["label"]
-        interview_focus = context_rule.get("interview_focus", "")
-        objective = config.get("objective", "")
-        consistency_rules = context_rule.get("consistency_rules", {})
-
-        evaluation = evaluate_response_simple(req.response, session["history"])
-
-        effective_sentiment = infer_effective_sentiment(
-            latest_response=req.response,
-            history=session["history"],
-            context_label=context_label
-        )
-
-        consistency_check = evaluate_consistency(
-            consistency_rules,
-            effective_sentiment
-        )
-        consistency_instruction = consistency_check.get("instruction")
-
-        # Update streak
+        # Low-engagement streak
         if evaluation["is_dont_know"]:
             session["dont_know_streak"] += 1
         else:
             session["dont_know_streak"] = 0
 
-        # Termination rules
         if session["dont_know_streak"] >= 3:
             return {
-                "context_label": context_label,
+                "route": route_label,
+                "decision": {
+                    "action": "stop",
+                    "reason": "low_engagement"
+                },
                 "deepdive": {
                     "should_continue": False,
                     "stop_reason": "low_engagement"
                 }
             }
 
-        if session["turn_count"] >= 4:
+        # Decide next action
+        decision = decide_next_action(
+            evaluation=evaluation,
+            session=session,
+            config=config,
+            route=route
+        )
+        action = decision["action"]
+
+        if action == "stop":
             return {
-                "context_label": context_label,
+                "route": route_label,
+                "decision": decision,
                 "deepdive": {
                     "should_continue": False,
-                    "stop_reason": "max_turns"
+                    "stop_reason": decision.get("reason", "complete")
                 }
             }
 
-        if evaluation["has_example"] and evaluation["is_specific"]:
-            return {
-                "context_label": context_label,
-                "deepdive": {
-                    "should_continue": False,
-                    "stop_reason": "sufficient_detail"
-                }
-            }
-
-        # Probe logic
-        if consistency_check["status"] == "mismatch":
-            probe_type = "contradiction"
-        elif consistency_check["status"] == "missing_side":
-            probe_type = "balance"
-        else:
-            probe_type = select_probe_type(
-                evaluation=evaluation,
-                context_label=context_label,
-                turn_count=session["turn_count"],
-                sentiment=effective_sentiment
-            )
-
-        if probe_type == "stop_candidate":
-            return {
-                "context_label": context_label,
-                "deepdive": {
-                    "should_continue": False,
-                    "stop_reason": "objective_satisfied"
-                }
-            }
-
-        question = await generate_deepdive_question(
-            objective=objective,
-            context_label=context_label,
-            interview_focus=interview_focus,
+        question = await generate_veronica_question(
+            config=config,
+            route=route,
             history=session["history"],
             latest_response=req.response,
-            probe_type=probe_type,
-            consistency_instruction=consistency_instruction
+            action=action
         )
 
         question_code = f"{req.question_id}_{session['turn_count'] + 1}"
 
         session["history"].append({"role": "assistant", "text": question})
         session["turn_count"] += 1
+        session["action_history"].append(action)
 
         return {
-            "context_label": context_label,
+            "route": route_label,
+            "decision": decision,
             "deepdive": {
                 "question_code": question_code,
                 "next_question": question,
-                "probe_type": probe_type,
+                "action": action,
                 "should_continue": True
             }
         }
