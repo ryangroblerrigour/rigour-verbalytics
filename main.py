@@ -24,11 +24,13 @@ Run locally:
 from __future__ import annotations
 
 import os
+import re
 import time
 import asyncio
 import csv
 import json
 import requests
+import unicodedata
 from typing import Optional, Literal, Dict, Any
 from time import monotonic
 from threading import RLock
@@ -60,8 +62,46 @@ INPUT_BLOCK_MODE = os.getenv("VERBALYTICS_BLOCK_INPUT_MODE", "flag").lower()
 
 
 # ---------------------------------------------------------------------
-# Locale helpers
+# Locale / language helpers
 # ---------------------------------------------------------------------
+def _clean_text(s: Optional[str]) -> str:
+    s = (s or "").strip()
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKC", s)
+    return s
+
+
+def _norm(s: str) -> str:
+    return _clean_text(s).lower()
+
+
+def _normalize_for_matching(s: Optional[str]) -> str:
+    s = _norm(s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _is_greek_text(s: Optional[str]) -> bool:
+    text = _clean_text(s)
+    if not text:
+        return False
+    greek_chars = sum(1 for ch in text if "\u0370" <= ch <= "\u03FF" or "\u1F00" <= ch <= "\u1FFF")
+    letters = sum(1 for ch in text if ch.isalpha())
+    return greek_chars >= 2 and (greek_chars / max(letters, 1)) >= 0.25
+
+
+def _language_bucket(locale: Optional[str], question: Optional[str] = None, response: Optional[str] = None) -> str:
+    loc = (locale or "").strip().lower().replace("_", "-")
+    if loc.startswith("el"):
+        return "el"
+    if loc.startswith("nl"):
+        return "nl"
+    if _is_greek_text(question) or _is_greek_text(response):
+        return "el"
+    return "en"
+
+
 def _locale_instruction(locale: Optional[str]) -> str:
     loc = (locale or "en").strip().lower().replace("_", "-")
 
@@ -83,6 +123,10 @@ def _locale_instruction(locale: Optional[str]) -> str:
         return "Respond in Polish only."
     if loc.startswith("ko"):
         return "Respond in Korean only."
+    if loc.startswith("el"):
+        return "Respond in Greek only."
+    if loc.startswith("nl"):
+        return "Respond in Dutch only."
     return "Respond in English only."
 
 
@@ -137,10 +181,6 @@ _block_loaded_at: float = 0.0
 _block_version: int = 0
 
 
-def _norm(s: str) -> str:
-    return (s or "").strip().lower()
-
-
 def _load_blocklist_csv(url: str) -> tuple[set[str], dict[str, set[str]]]:
     g, p = set(), {}
     if not url:
@@ -152,7 +192,7 @@ def _load_blocklist_csv(url: str) -> tuple[set[str], dict[str, set[str]]]:
         for row in reader:
             scope = _norm(row.get("scope", ""))
             proj = _norm(row.get("project", ""))
-            phrase = _norm(row.get("phrase", ""))
+            phrase = _normalize_for_matching(row.get("phrase", ""))
             if not phrase:
                 continue
             if scope == "global" or scope == "":
@@ -190,25 +230,295 @@ def get_block_phrases(project_id: Optional[str]) -> set[str]:
 def contains_blocked_phrase(text: str, project_id: Optional[str]) -> bool:
     if not text:
         return False
-    lt = text.lower()
+    lt = _normalize_for_matching(text)
     return any(p in lt for p in get_block_phrases(project_id))
 
 
 def find_blocked_phrases(text: str, project_id: Optional[str]) -> list[str]:
     if not text:
         return []
-    lt = text.lower()
+    lt = _normalize_for_matching(text)
     phrases = get_block_phrases(project_id)
     hits = {p for p in phrases if p and p in lt}
     return sorted(list(hits))
 
 
 # ---------------------------------------------------------------------
+# Language packs
+# ---------------------------------------------------------------------
+LANG_RULES = {
+    "en": {
+        "empty_values": {"", "na", "n/a", "none", "no idea", "idk", "?"},
+        "reason_markers": {"because", "since", "due", "therefore", "so"},
+        "emphasis_markers": {"especially", "particularly"},
+        "first_hand_markers": {
+            "i use", "i used", "i tried", "i've used", "i have used", "i bought", "we bought",
+            "my kids use", "my kid uses", "my children", "my family", "we use", "i saw", "i heard", "i've seen"
+        },
+        "usage_context": {
+            "at home", "at work", "for work", "on the train", "on the commute", "in the car",
+            "at night", "in the morning", "on weekends", "after school", "during football", "during ads",
+            "when cooking", "when cleaning", "while driving", "before bed"
+        },
+        "feature_sensory": {
+            "logo", "pack", "packaging", "design", "music", "jingle", "voiceover", "scene", "actor", "character", "dog",
+            "taste", "smell", "texture", "colour", "color", "price", "offer", "discount", "durable", "battery", "speed",
+            "instructions", "interface", "app", "sound", "volume", "quality", "resolution", "camera", "label", "slogan"
+        },
+        "example_markers": {"for example", "such as", "like when", "like the time", "e.g.", "especially", "particularly"},
+        "opinion_q": {"think", "opinion", "feel", "like", "dislike", "impression", "favourite", "favorite", "rate"},
+        "subjective_resp": {
+            "good", "bad", "great", "love", "hate", "nice", "funny", "boring", "memorable", "confusing", "clear",
+            "useful", "annoying", "enjoy", "enjoyed", "liked", "disliked", "amazing", "awful", "meh"
+        },
+        "refers_to_item": {"ad", "advert", "advertisement", "commercial", "spot", "it", "this"},
+        "fillers": {"like", "basically", "sort of", "kind of", "you know", "stuff", "things"},
+        "templ": [
+            "as an ai", "as a language model", "overall,", "moreover,", "furthermore,",
+            "in summary", "in conclusion", "additionally,", "importantly,"
+        ],
+        "invalid_short": {"ok", "yes", "no", "maybe", "idk", "don't know", "dont know", "not sure", "nothing"},
+        "fallback_short_followup": "Could you share a bit more detail about that?",
+        "fallback_followup": "What specifically makes you say that?",
+        "repair_numeric": "Could you explain what you mean by '{value}' in relation to: {question}",
+        "repair_general": "Could you expand a bit more on that in relation to: {question}",
+        "deepdive_questions": {
+            "low_score": {
+                "ask_why_that_wording": "What is it about that wording or phrase that doesn’t work for you?",
+                "ask_which_words": "Which words or phrases made it feel that way to you?",
+                "ask_specific_words": "What specifically about the tone or wording didn’t work for you?",
+                "ask_which_visuals": "What specifically in the visuals or design made it feel that way?",
+                "ask_specific_visuals": "What specifically about the visuals or design didn’t work for you?",
+                "ask_meaning": "What about the message or meaning didn’t feel right to you?",
+                "ask_specifics": "What specifically about it didn’t work for you?",
+            },
+            "mid_score": {
+                "explore_both_sides_words": "Which parts of the wording worked for you, and which didn’t?",
+                "explore_both_sides_visuals": "What about the visuals or design worked for you, and what didn’t?",
+                "explore_both_sides": "What worked for you, and what didn’t?",
+            },
+            "high_score": {
+                "ask_why_that_wording": "What is it about that wording or phrase that resonated with you?",
+                "ask_specific_words": "What specifically about the wording or tone resonated with you?",
+                "ask_specific_visuals": "What specifically about the visuals or design resonated with you?",
+                "ask_meaning": "What about the message or meaning connected with you?",
+                "ask_specifics": "What specifically made it resonate with you?",
+            },
+            "neutral": {
+                "ask_which_words": "Which words or phrases made you feel that way?",
+                "ask_specific_words": "What specifically about the wording or tone stood out to you?",
+                "ask_specific_visuals": "What specifically about the visuals or design stood out to you?",
+                "ask_meaning": "What about the message or meaning stood out to you?",
+                "clarify": "What specifically do you mean by that?",
+            }
+        },
+        "deepdive_eval": {
+            "criticism_words": [
+                "generic", "bland", "unclear", "confusing", "overused",
+                "flat", "vague", "weak", "boring", "too much", "too little"
+            ],
+            "mentions_language": ["tone", "word", "words", "phrase", "phrases", "wording", "language", "message", "line"],
+            "mentions_visuals": ["colour", "color", "visual", "visuals", "design", "layout", "look", "font", "image", "images"],
+            "mentions_meaning": ["meaning", "means", "suggests", "implies", "comes across", "feels", "felt"],
+            "mentions_relevance": ["for me", "to me", "personally", "relevant", "connect", "doesn't connect", "doesnt connect"],
+        },
+    },
+    "el": {
+        "empty_values": {"", "δκ", "δ/ξ", "δεν ξερω", "δεν ξέρω", "κανενα", "κανένα", "?"},
+        "reason_markers": {"γιατί", "επειδή", "λόγω", "διοτι", "διότι", "οπότε", "άρα"},
+        "emphasis_markers": {"ειδικά", "ιδιαίτερα", "κυρίως"},
+        "first_hand_markers": {
+            "το χρησιμοποιώ", "το χρησιμοποίησα", "το έχω χρησιμοποιήσει", "το εχω χρησιμοποιησει",
+            "το αγόρασα", "το αγορασα", "το είδα", "το ειδα", "το άκουσα", "το ακουσα",
+            "στην οικογένειά μου", "στην οικογενεια μου", "στο σπίτι", "στο σπιτι", "το χρησιμοποιούμε", "το χρησιμοποιουμε"
+        },
+        "usage_context": {
+            "στο σπίτι", "στο σπιτι", "στη δουλειά", "στη δουλεια", "για τη δουλειά", "για τη δουλεια",
+            "στο αυτοκίνητο", "στο αυτοκινητο", "το βράδυ", "το βραδυ", "το πρωί", "το πρωι",
+            "τα σαββατοκύριακα", "τα σαββατοκυριακα", "πριν τον ύπνο", "πριν τον υπνο"
+        },
+        "feature_sensory": {
+            "λογότυπο", "λογοτυπο", "συσκευασία", "σχεδιασμός", "σχεδιασμος", "μουσική", "μουσικη",
+            "φωνή", "φωνη", "σκηνή", "σκηνη", "χαρακτήρας", "χαρακτηρας", "γεύση", "γευση",
+            "μυρωδιά", "μυρωδια", "υφή", "υφη", "χρώμα", "χρωμα", "τιμή", "τιμη", "προσφορά",
+            "έκπτωση", "εκπτωση", "μπαταρία", "μπαταρια", "ταχύτητα", "ταχυτητα",
+            "οδηγίες", "οδηγιες", "διεπαφή", "διεπαφη", "εφαρμογή", "εφαρμογη", "ήχος", "ηχος",
+            "ποιότητα", "ποιοτητα", "κάμερα", "καμερα", "σλόγκαν", "συνθημα"
+        },
+        "example_markers": {"για παράδειγμα", "για παραδειγμα", "όπως όταν", "οπως οταν", "ειδικά", "ιδιαίτερα"},
+        "opinion_q": {"πιστεύεις", "πιστευεις", "γνώμη", "γνωμη", "νιώθεις", "νιωθεις", "σου αρέσει", "σου αρεσει", "βαθμολογείς", "βαθμολογεις"},
+        "subjective_resp": {
+            "καλό", "καλο", "κακή", "κακη", "κακό", "κακο", "πολύ καλό", "τέλειο", "τελειο", "μου αρέσει",
+            "μου αρεσει", "δεν μου αρέσει", "δεν μου αρεσει", "βαρετό", "βαρετο", "ξεκάθαρο", "ξεκαθαρο",
+            "χρήσιμο", "χρησιμο", "ενοχλητικό", "ενοχλητικο", "δυνατό", "αδύναμο", "αδυναμο",
+            "συγχυτικό", "συγχυτικο", "ελκυστικό", "ελκυστικο"
+        },
+        "refers_to_item": {"διαφήμιση", "διαφημιση", "σποτ", "αυτό", "αυτο", "αυτό το", "αυτο το"},
+        "fillers": {"δηλαδή", "δηλαδη", "κάπως", "καπως", "ξέρεις", "ξερεις", "πράγματα", "πραγματα"},
+        "templ": [
+            "ως ai", "ως τεχνητή νοημοσύνη", "ως τεχνητη νοημοσυνη",
+            "συνολικά", "συνολικα", "επιπλέον", "επιπλεον", "συμπερασματικά", "συμπερασματικα"
+        ],
+        "invalid_short": {"οκ", "ναι", "όχι", "οχι", "ίσως", "ισως", "δκ", "δεν ξέρω", "δεν ξερω", "τίποτα", "τιποτα"},
+        "fallback_short_followup": "Θα μπορούσατε να δώσετε λίγο περισσότερη λεπτομέρεια;",
+        "fallback_followup": "Τι ακριβώς σας κάνει να το λέτε αυτό;",
+        "repair_numeric": "Θα μπορούσατε να εξηγήσετε τι εννοείτε με το «{value}» σε σχέση με: {question}",
+        "repair_general": "Θα μπορούσατε να το εξηγήσετε λίγο περισσότερο σε σχέση με: {question}",
+        "deepdive_questions": {
+            "low_score": {
+                "ask_why_that_wording": "Τι είναι αυτό στη διατύπωση ή στη φράση που δεν σας λειτουργεί;",
+                "ask_which_words": "Ποιες λέξεις ή φράσεις σας έκαναν να το νιώσετε αυτό;",
+                "ask_specific_words": "Τι συγκεκριμένα στον τόνο ή στη διατύπωση δεν σας λειτούργησε;",
+                "ask_which_visuals": "Τι συγκεκριμένα στα οπτικά ή στο design σας έκανε να το νιώσετε αυτό;",
+                "ask_specific_visuals": "Τι συγκεκριμένα στα οπτικά ή στο design δεν σας λειτούργησε;",
+                "ask_meaning": "Τι στο μήνυμα ή στο νόημα δεν σας φάνηκε σωστό;",
+                "ask_specifics": "Τι συγκεκριμένα δεν λειτούργησε για εσάς;",
+            },
+            "mid_score": {
+                "explore_both_sides_words": "Ποια σημεία της διατύπωσης λειτούργησαν για εσάς και ποια όχι;",
+                "explore_both_sides_visuals": "Τι στα οπτικά ή στο design λειτούργησε για εσάς και τι όχι;",
+                "explore_both_sides": "Τι λειτούργησε για εσάς και τι όχι;",
+            },
+            "high_score": {
+                "ask_why_that_wording": "Τι είναι αυτό στη διατύπωση ή στη φράση που σας έκανε θετική εντύπωση;",
+                "ask_specific_words": "Τι συγκεκριμένα στη διατύπωση ή στον τόνο σας άρεσε;",
+                "ask_specific_visuals": "Τι συγκεκριμένα στα οπτικά ή στο design σας άρεσε;",
+                "ask_meaning": "Τι στο μήνυμα ή στο νόημα συνδέθηκε με εσάς;",
+                "ask_specifics": "Τι συγκεκριμένα το έκανε να σας ταιριάζει;",
+            },
+            "neutral": {
+                "ask_which_words": "Ποιες λέξεις ή φράσεις σας έκαναν να νιώσετε έτσι;",
+                "ask_specific_words": "Τι συγκεκριμένα στη διατύπωση ή στον τόνο ξεχώρισε για εσάς;",
+                "ask_specific_visuals": "Τι συγκεκριμένα στα οπτικά ή στο design ξεχώρισε για εσάς;",
+                "ask_meaning": "Τι στο μήνυμα ή στο νόημα ξεχώρισε για εσάς;",
+                "clarify": "Τι ακριβώς εννοείτε με αυτό;",
+            }
+        },
+        "deepdive_eval": {
+            "criticism_words": [
+                "γενικό", "γενικη", "γενικόλογο", "αόριστο", "αοριστο", "μπερδεμένο", "μπερδεμενο",
+                "αδύναμο", "αδυναμο", "βαρετό", "βαρετο", "πολύ", "λίγο", "λιγο"
+            ],
+            "mentions_language": [
+                "τόνος", "τονος", "λέξη", "λεξη", "λέξεις", "λεξεις",
+                "φράση", "φραση", "φράσεις", "φρασεις", "διατύπωση", "διατυπωση", "γλώσσα", "γλωσσα", "μήνυμα", "μηνυμα"
+            ],
+            "mentions_visuals": [
+                "χρώμα", "χρωμα", "οπτικό", "οπτικο", "οπτικά", "οπτικα", "σχεδιασμός", "σχεδιασμος",
+                "διάταξη", "διαταξη", "γραμματοσειρά", "γραμματοσειρα", "εικόνα", "εικονα", "εικόνες", "εικονες"
+            ],
+            "mentions_meaning": [
+                "νόημα", "νοημα", "σημαίνει", "σημαινει", "υπονοεί", "υπονοει",
+                "δείχνει", "δειχνει", "ακούγεται", "ακουγεται", "νιώθω", "νιωθω", "ένιωσα", "ενιωσα"
+            ],
+            "mentions_relevance": [
+                "για μένα", "για μενα", "σε μένα", "σε μενα", "προσωπικά", "προσωπικα",
+                "σχετικό", "σχετικο", "με συνδέει", "δεν με συνδέει", "δεν συνδέεται", "δεν συνδεεται"
+            ],
+        },
+    },
+    "nl": {
+        "empty_values": {"", "nvt", "n.v.t", "geen idee", "weet ik niet", "?", "niks"},
+        "reason_markers": {"omdat", "want", "doordat", "daardoor", "dus"},
+        "emphasis_markers": {"vooral", "met name", "eigenlijk"},
+        "first_hand_markers": {
+            "ik gebruik", "ik gebruikte", "ik heb gebruikt", "ik heb het gebruikt",
+            "ik kocht", "ik heb gekocht", "ik zag", "ik heb gezien", "ik hoorde",
+            "wij gebruiken", "mijn familie", "mijn kinderen", "thuis gebruiken we"
+        },
+        "usage_context": {
+            "thuis", "op het werk", "voor werk", "in de trein", "in de auto",
+            "s avonds", "in de ochtend", "in het weekend", "voor het slapengaan"
+        },
+        "feature_sensory": {
+            "logo", "verpakking", "ontwerp", "design", "muziek", "stem", "scene",
+            "personage", "smaak", "geur", "textuur", "kleur", "prijs", "aanbieding",
+            "korting", "duurzaam", "batterij", "snelheid", "instructies", "interface",
+            "app", "geluid", "volume", "kwaliteit", "resolutie", "camera", "label", "slogan"
+        },
+        "example_markers": {"bijvoorbeeld", "zoals", "vooral", "met name"},
+        "opinion_q": {"denken", "vind", "vindt", "gevoel", "mening", "leuk", "niet leuk", "indruk", "favoriet", "beoordelen"},
+        "subjective_resp": {
+            "goed", "slecht", "geweldig", "mooi", "saai", "duidelijk", "nuttig",
+            "irritant", "verwarrend", "leuk", "niet leuk", "ik vind het goed",
+            "ik vind het slecht", "sterk", "zwak", "aantrekkelijk", "onaantrekkelijk"
+        },
+        "refers_to_item": {"advertentie", "reclame", "spot", "dit", "het", "deze"},
+        "fillers": {"zeg maar", "een beetje", "soort van", "dingen", "enzo"},
+        "templ": [
+            "als ai", "als taalmodel", "over het algemeen", "bovendien",
+            "samenvattend", "concluderend", "daarnaast", "belangrijk is"
+        ],
+        "invalid_short": {"ok", "ja", "nee", "misschien", "geen idee", "weet ik niet", "niks"},
+        "fallback_short_followup": "Kunt u daar iets meer detail over geven?",
+        "fallback_followup": "Wat maakt dat u dat zegt?",
+        "repair_numeric": "Kunt u uitleggen wat u bedoelt met '{value}' in relatie tot: {question}",
+        "repair_general": "Kunt u daar iets verder op ingaan in relatie tot: {question}",
+        "deepdive_questions": {
+            "low_score": {
+                "ask_why_that_wording": "Wat is er aan die formulering of zin dat voor u niet werkt?",
+                "ask_which_words": "Welke woorden of zinnen gaven u dat gevoel?",
+                "ask_specific_words": "Wat werkte er precies niet aan de toon of formulering?",
+                "ask_which_visuals": "Wat in de visuals of het design gaf u precies dat gevoel?",
+                "ask_specific_visuals": "Wat werkte er precies niet aan de visuals of het design?",
+                "ask_meaning": "Wat voelde er niet goed aan in de boodschap of betekenis?",
+                "ask_specifics": "Wat werkte er precies niet voor u?",
+            },
+            "mid_score": {
+                "explore_both_sides_words": "Welke delen van de formulering werkten wel voor u en welke niet?",
+                "explore_both_sides_visuals": "Wat werkte er aan de visuals of het design wel voor u en wat niet?",
+                "explore_both_sides": "Wat werkte er voor u wel en wat niet?",
+            },
+            "high_score": {
+                "ask_why_that_wording": "Wat is het aan die formulering of zin dat bij u aansloeg?",
+                "ask_specific_words": "Wat sprak u precies aan in de formulering of toon?",
+                "ask_specific_visuals": "Wat sprak u precies aan in de visuals of het design?",
+                "ask_meaning": "Wat in de boodschap of betekenis sloot bij u aan?",
+                "ask_specifics": "Wat maakte dat het voor u werkte?",
+            },
+            "neutral": {
+                "ask_which_words": "Welke woorden of zinnen gaven u dat gevoel?",
+                "ask_specific_words": "Wat viel u precies op aan de formulering of toon?",
+                "ask_specific_visuals": "Wat viel u precies op aan de visuals of het design?",
+                "ask_meaning": "Wat viel u op aan de boodschap of betekenis?",
+                "clarify": "Wat bedoelt u daar precies mee?",
+            }
+        },
+        "deepdive_eval": {
+            "criticism_words": [
+                "algemeen", "vaag", "onduidelijk", "verwarrend", "saai",
+                "zwak", "te veel", "te weinig", "standaard", "flauw"
+            ],
+            "mentions_language": [
+                "toon", "woord", "woorden", "zin", "zinnen",
+                "formulering", "taal", "boodschap", "tekst"
+            ],
+            "mentions_visuals": [
+                "kleur", "visueel", "visuals", "design", "ontwerp",
+                "layout", "lettertype", "afbeelding", "afbeeldingen"
+            ],
+            "mentions_meaning": [
+                "betekenis", "betekent", "suggereert", "impliceert",
+                "komt over", "voelt", "gevoel"
+            ],
+            "mentions_relevance": [
+                "voor mij", "persoonlijk", "relevant", "past bij mij",
+                "sluit aan", "sluit niet aan", "verbinding"
+            ],
+        },
+    },
+}
+
+
+# ---------------------------------------------------------------------
 # Scoring Engine
 # ---------------------------------------------------------------------
 class ScoreEngine:
+    WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+
     def _tokens(self, s: str) -> list[str]:
-        return [t.lower().strip(",.;:!?()[]{}\"'") for t in (s or "").split() if t.strip()]
+        text = _normalize_for_matching(s)
+        return self.WORD_RE.findall(text)
 
     def _jaccard(self, a: set[str], b: set[str]) -> float:
         if not a or not b:
@@ -217,52 +527,40 @@ class ScoreEngine:
         union = len(a | b)
         return inter / union if union else 0.0
 
-    def subscores(self, question: str, response: str) -> dict:
-        q = (question or "").strip()
-        r = (response or "").strip()
+    def _has_any_phrase(self, hay: str, phrases: set[str]) -> bool:
+        return any(p in hay for p in phrases)
 
-        if not r or r.lower() in {"", "na", "n/a", "none", "no idea", "idk", "?"}:
+    def subscores(self, question: str, response: str, locale: Optional[str] = None) -> dict:
+        q = _clean_text(question)
+        r = _clean_text(response)
+        lang = _language_bucket(locale, q, r)
+        rules = LANG_RULES[lang]
+
+        r_norm = _normalize_for_matching(r)
+        q_norm = _normalize_for_matching(q)
+
+        if not r_norm or r_norm in rules["empty_values"]:
             return {"specificity": 0, "concreteness": 0, "relevance": 0, "clarity": 0}
 
-        q_toks = set(self._tokens(q))
-        r_toks = self._tokens(r)
+        q_toks = set(self._tokens(q_norm))
+        r_toks = self._tokens(r_norm)
         r_set = set(r_toks)
         wc = len(r_toks)
 
-        has_reason = any(k in r_set for k in {"because", "since", "so that", "due"})
-        has_emphasis = "especially" in r_set or "particularly" in r_set
+        has_reason = any(k in r_set for k in rules["reason_markers"]) or self._has_any_phrase(r_norm, set(rules["reason_markers"]))
+        has_emphasis = any(k in r_set for k in rules["emphasis_markers"]) or self._has_any_phrase(r_norm, set(rules["emphasis_markers"]))
         unique_terms = len([t for t in r_set if t not in q_toks and len(t) > 3])
+
         spec_base = 55 * (1 - (2.71828 ** (-wc / 16)))
         spec_bonus = (12 if has_reason else 0) + (8 if has_emphasis else 0) + min(22, unique_terms)
         specificity = max(0, min(100, int(spec_base + spec_bonus)))
 
-        first_hand_markers = {
-            "i use", "i used", "i tried", "i've used", "i have used", "i bought", "we bought",
-            "my kids use", "my kid uses", "my children", "my family", "we use", "i saw", "i heard", "i've seen"
-        }
-        usage_context = {
-            "at home", "at work", "for work", "on the train", "on the commute", "in the car",
-            "at night", "in the morning", "on weekends", "after school", "during football", "during ads",
-            "when cooking", "when cleaning", "while driving", "before bed"
-        }
-        feature_sensory = {
-            "logo", "pack", "packaging", "design", "music", "jingle", "voiceover", "scene", "actor", "character", "dog",
-            "taste", "smell", "texture", "colour", "color", "price", "offer", "discount", "durable", "battery", "speed",
-            "instructions", "interface", "app", "sound", "volume", "quality", "resolution", "camera", "label", "slogan"
-        }
-        example_markers = {"for example", "such as", "like when", "like the time", "e.g.", "especially", "particularly"}
+        first_hand = self._has_any_phrase(r_norm, rules["first_hand_markers"])
+        context_hit = self._has_any_phrase(r_norm, rules["usage_context"])
+        example_hit = self._has_any_phrase(r_norm, rules["example_markers"])
+        feature_hits = sum(1 for f in rules["feature_sensory"] if f in r_set or f in r_norm)
 
-        rt = " " + " ".join(r_toks) + " "
-
-        def has_any_phrase(hay: str, phrases: set[str]) -> bool:
-            return any((" " + p + " ") in hay for p in phrases)
-
-        first_hand = has_any_phrase(rt, first_hand_markers)
-        context_hit = has_any_phrase(rt, usage_context)
-        example_hit = has_any_phrase(rt, example_markers)
-        feature_hits = sum(1 for f in feature_sensory if f in r_set)
-
-        properish = sum(1 for w in (response.split()) if (w[:1].isupper() and len(w) > 3))
+        properish = sum(1 for w in response.split() if (w[:1].isupper() and len(w) > 3))
         length_credit = min(28, wc // 5)
 
         conc_score = (
@@ -276,12 +574,9 @@ class ScoreEngine:
         concreteness = max(0, min(100, int(conc_score)))
 
         rel_overlap = 100 * self._jaccard(q_toks, r_set)
-        opinion_q = any(k in q_toks for k in {"think", "opinion", "feel", "like", "dislike", "impression", "favourite", "favorite", "rate"})
-        subjective_resp = any(k in r_set for k in {
-            "good", "bad", "great", "love", "hate", "nice", "funny", "boring", "memorable", "confusing", "clear", "useful", "annoying",
-            "enjoy", "enjoyed", "liked", "disliked", "amazing", "awful", "meh"
-        })
-        refers_to_item = any(k in r_set for k in {"ad", "advert", "advertisement", "commercial", "spot", "it", "this"})
+        opinion_q = any(k in q_toks for k in rules["opinion_q"]) or self._has_any_phrase(q_norm, set(rules["opinion_q"]))
+        subjective_resp = any(k in r_set for k in rules["subjective_resp"]) or self._has_any_phrase(r_norm, set(rules["subjective_resp"]))
+        refers_to_item = any(k in r_set for k in rules["refers_to_item"]) or self._has_any_phrase(r_norm, set(rules["refers_to_item"]))
 
         rel_heur = 0
         if opinion_q and subjective_resp:
@@ -290,12 +585,12 @@ class ScoreEngine:
             rel_heur += 15
         relevance = max(0, min(100, int(max(rel_overlap, rel_heur))))
 
-        sentences = [s for s in r.replace("!", ".").split(".") if s.strip()]
+        sentences = [s for s in re.split(r"[.!;;;\n]+", r) if s.strip()]
         avg_len = (sum(len(self._tokens(s)) for s in sentences) / len(sentences)) if sentences else wc
         too_long = avg_len > 28
         too_short = avg_len < 3
-        fillers = {"like", "basically", "sort of", "kind of", "you know", "stuff", "things"}
-        hedge = any(f in " ".join(r_toks) for f in fillers)
+        hedge = any(f in r_norm for f in rules["fillers"])
+
         clarity_base = 82
         clarity_pen = (14 if too_long else 0) + (14 if too_short else 0) + (8 if hedge else 0)
         clarity = max(0, min(100, int(clarity_base - clarity_pen)))
@@ -307,16 +602,21 @@ class ScoreEngine:
             "clarity": clarity,
         }
 
-    def quality_score(self, q: str, r: str) -> int:
-        ss = self.subscores(q, r)
+    def quality_score(self, q: str, r: str, locale: Optional[str] = None) -> int:
+        ss = self.subscores(q, r, locale=locale)
         avg = (ss["specificity"] + ss["concreteness"] + ss["relevance"] + ss["clarity"]) / 4
         return max(0, min(100, int(round(avg / 10) * 10)))
 
-    def ai_likelihood(self, r: str) -> int:
+    def ai_likelihood(self, r: str, locale: Optional[str] = None) -> int:
         if not r:
             return 0
+
+        lang = _language_bucket(locale, response=r)
+        rules = LANG_RULES[lang]
+
         toks = self._tokens(r)
         wc = len(toks)
+        r_norm = _normalize_for_matching(r)
 
         base = 0
         if wc >= 8:
@@ -324,15 +624,11 @@ class ScoreEngine:
         if wc >= 20:
             base = 10
 
-        templ = [
-            "as an ai", "as a language model", "overall,", "moreover,", "furthermore,",
-            "in summary", "in conclusion", "additionally,", "importantly,"
-        ]
-        templ_hits = sum(1 for t in templ if t in r.lower())
+        templ_hits = sum(1 for t in rules["templ"] if t in r_norm)
 
-        sents = [s.strip() for s in r.replace("!", ".").split(".") if s.strip()]
+        sents = [s.strip() for s in re.split(r"[.!;;;\n]+", r_norm) if s.strip()]
         lengths = [len(self._tokens(s)) for s in sents] or [wc]
-        var = (max(lengths) - min(lengths))
+        var = max(lengths) - min(lengths)
         low_var = 12 if (len(lengths) >= 3 and var <= 4) else 0
 
         uniq_ratio = len(set(toks)) / (wc or 1)
@@ -385,7 +681,7 @@ async def _call_openai_chat(messages: list[dict], model: str, max_tokens: int) -
             max_completion_tokens=max_tokens,
             stop=["\n"],
         )
-        return resp.choices[0].message.content.strip()
+        return (resp.choices[0].message.content or "").strip()
 
     try:
         return await asyncio.wait_for(loop.run_in_executor(None, _block_call), timeout=OPENAI_TIMEOUT)
@@ -413,7 +709,7 @@ async def generate_ack(q: str, r: str, project_id: Optional[str], locale: Option
 
 
 async def generate_snapback(q: str, r: str, project_id: Optional[str], locale: Optional[str], model: str = DEFAULT_MODEL_SNAPBACK) -> Optional[str]:
-    if not r or len(r.split()) <= 3:
+    if not r or len(score_engine._tokens(r)) <= 3:
         messages = [
             {"role": "system", "content": SYSTEM_SNAPBACK + " " + _locale_instruction(locale)},
             {"role": "user", "content": f"Original question: {q.strip()} Respondent's answer: {r.strip()}"},
@@ -426,10 +722,11 @@ async def generate_snapback(q: str, r: str, project_id: Optional[str], locale: O
 
 
 def _fallback_followup(q: str, r: str, locale: Optional[str]) -> str:
-    rlow = (r or "").lower()
-    if len(rlow.split()) <= 3:
-        return "Could you share a bit more detail about that?"
-    return "What specifically makes you say that?"
+    lang = _language_bucket(locale, q, r)
+    rules = LANG_RULES[lang]
+    if len(score_engine._tokens(r)) <= 3:
+        return rules["fallback_short_followup"]
+    return rules["fallback_followup"]
 
 
 async def generate_followup(
@@ -447,7 +744,7 @@ async def generate_followup(
     text = await _call_openai_chat(messages, model=model, max_tokens=min(48, MAX_TOKENS))
     t = (text or "").strip().replace("\n", " ")
 
-    if not t or t == "?" or len(t.split()) < 6:
+    if not t or t == "?" or len(score_engine._tokens(t)) < 6:
         t = _fallback_followup(question, response, locale)
 
     if not t.endswith("?") and not t.endswith("؟"):
@@ -461,7 +758,7 @@ async def generate_followup(
         ]
         text2 = await _call_openai_chat(messages2, model=model, max_tokens=min(48, MAX_TOKENS))
         t2 = (text2 or "").strip().replace("\n", " ")
-        if t2 and len(t2.split()) >= 6 and (t2.endswith("?") or t2.endswith("؟")) and not contains_blocked_phrase(t2, project_id):
+        if t2 and len(score_engine._tokens(t2)) >= 6 and (t2.endswith("?") or t2.endswith("؟")) and not contains_blocked_phrase(t2, project_id):
             return t2
 
     return t
@@ -470,7 +767,7 @@ async def generate_followup(
 # ---------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------
-app = FastAPI(title="Verbalytics API", version="2.3.0")
+app = FastAPI(title="Verbalytics API", version="2.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -545,9 +842,9 @@ async def verbalytics(payload: VerbalyticsInput = Body(...)):
     subs = None
     score = ai_like = None
     if want_score:
-        subs = score_engine.subscores(payload.question, payload.response)
-        score = score_engine.quality_score(payload.question, payload.response)
-        ai_like = score_engine.ai_likelihood(payload.response)
+        subs = score_engine.subscores(payload.question, payload.response, locale=payload.locale)
+        score = score_engine.quality_score(payload.question, payload.response, locale=payload.locale)
+        ai_like = score_engine.ai_likelihood(payload.response, locale=payload.locale)
 
     ack_res = follow_res = snap_res = None
     try:
@@ -599,9 +896,9 @@ async def verbalytics_stream(payload: VerbalyticsInput = Body(...)):
             return
 
         if want_score:
-            subs = score_engine.subscores(payload.question, payload.response)
-            score = score_engine.quality_score(payload.question, payload.response)
-            ai_like = score_engine.ai_likelihood(payload.response)
+            subs = score_engine.subscores(payload.question, payload.response, locale=payload.locale)
+            score = score_engine.quality_score(payload.question, payload.response, locale=payload.locale)
+            ai_like = score_engine.ai_likelihood(payload.response, locale=payload.locale)
             yield JSONResponse(content={
                 "type": "score",
                 "subscores": subs,
@@ -663,10 +960,11 @@ async def admin_blocklist_refresh():
 
 
 # =========================================================
-# DEEPDIVE MODULE (STAGE 4 - BETTER LANGUAGE FOLLOW-UPS)
+# DEEPDIVE MODULE
 # =========================================================
 
 SESSIONS = {}
+
 
 class DeepDiveRequest(BaseModel):
     project_id: str
@@ -674,6 +972,7 @@ class DeepDiveRequest(BaseModel):
     question_id: str
     response: str
     prior_answers: Optional[Dict[str, float]] = None
+    locale: Optional[str] = None
 
 
 def get_session_key(project_id, respondent_id, question_id):
@@ -693,7 +992,7 @@ def load_question_config(project_id, question_id):
     if not os.path.exists(path):
         raise FileNotFoundError(f"Config not found at {path}")
 
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -725,50 +1024,30 @@ def evaluate_route(config, prior_answers):
     }
 
 
-def evaluate_response_veronica(response: str):
-    rl = (response or "").lower().strip()
+def evaluate_response_veronica(response: str, locale: Optional[str] = None):
+    lang = _language_bucket(locale, response=response)
+    eval_rules = LANG_RULES[lang]["deepdive_eval"]
 
-    criticism_words = [
-        "generic", "bland", "unclear", "confusing", "overused",
-        "flat", "vague", "weak", "boring", "too much", "too little"
-    ]
-
-    quoted_phrase = ("'" in response) or ('"' in response)
+    rl = _normalize_for_matching(response)
+    quoted_phrase = ("'" in response) or ('"' in response) or ("«" in response) or ("»" in response)
 
     return {
-        "mentions_language": any(
-            x in rl for x in [
-                "tone", "word", "words", "phrase", "phrases",
-                "wording", "language", "message", "line"
-            ]
-        ),
-        "mentions_visuals": any(
-            x in rl for x in [
-                "colour", "color", "visual", "visuals",
-                "design", "layout", "look", "font", "image", "images"
-            ]
-        ),
-        "mentions_meaning": any(
-            x in rl for x in [
-                "meaning", "means", "suggests", "implies",
-                "comes across", "feels", "felt"
-            ]
-        ),
-        "mentions_relevance": any(
-            x in rl for x in [
-                "for me", "to me", "personally", "relevant",
-                "connect", "doesn't connect", "doesnt connect"
-            ]
-        ),
-        "is_vague": len(rl.split()) < 5,
-        "has_criticism_word": any(x in rl for x in criticism_words),
-        "quoted_phrase": quoted_phrase
+        "mentions_language": any(x in rl for x in eval_rules["mentions_language"]),
+        "mentions_visuals": any(x in rl for x in eval_rules["mentions_visuals"]),
+        "mentions_meaning": any(x in rl for x in eval_rules["mentions_meaning"]),
+        "mentions_relevance": any(x in rl for x in eval_rules["mentions_relevance"]),
+        "is_vague": len(score_engine._tokens(rl)) < 5,
+        "has_criticism_word": any(x in rl for x in eval_rules["criticism_words"]),
+        "quoted_phrase": quoted_phrase,
+        "lang": lang,
     }
 
 
-def is_invalid_response(response: str) -> bool:
-    r = (response or "").strip()
-    rl = r.lower()
+def is_invalid_response(response: str, locale: Optional[str] = None) -> bool:
+    r = _clean_text(response)
+    rl = _normalize_for_matching(r)
+    lang = _language_bucket(locale, response=r)
+    rules = LANG_RULES[lang]
 
     if not r:
         return True
@@ -776,92 +1055,87 @@ def is_invalid_response(response: str) -> bool:
     if r.isdigit():
         return True
 
-    invalid_short = {
-        "ok", "yes", "no", "maybe", "idk", "don't know", "dont know", "not sure", "nothing"
-    }
-    if rl in invalid_short:
+    if rl in rules["invalid_short"]:
         return True
 
-    if len(r.split()) <= 1:
+    if len(score_engine._tokens(r)) <= 1:
         return True
 
     return False
 
 
-def generate_repair_question(previous_question: str, bad_response: str) -> str:
-    r = (bad_response or "").strip()
+def generate_repair_question(previous_question: str, bad_response: str, locale: Optional[str] = None) -> str:
+    lang = _language_bucket(locale, previous_question, bad_response)
+    rules = LANG_RULES[lang]
+
+    r = _clean_text(bad_response)
 
     if r.isdigit():
-        return f"Could you explain what you mean by '{r}' in relation to: {previous_question}"
+        return rules["repair_numeric"].format(value=r, question=previous_question)
 
-    return f"Could you expand a bit more on that in relation to: {previous_question}"
+    return rules["repair_general"].format(question=previous_question)
 
 
-def choose_next_question(route_label: str, evaluation: dict):
-    # LOW SCORE
+def choose_next_question(route_label: str, evaluation: dict, locale: Optional[str] = None):
+    lang = evaluation.get("lang") or _language_bucket(locale)
+    qset = LANG_RULES[lang]["deepdive_questions"]
+
     if route_label == "low_score":
         if evaluation["mentions_language"]:
             if evaluation["quoted_phrase"]:
-                return "What is it about that wording or phrase that doesn’t work for you?", "ask_why_that_wording"
+                return qset["low_score"]["ask_why_that_wording"], "ask_why_that_wording"
             if evaluation["has_criticism_word"]:
-                return "Which words or phrases made it feel that way to you?", "ask_which_words"
-            return "What specifically about the tone or wording didn’t work for you?", "ask_specific_words"
+                return qset["low_score"]["ask_which_words"], "ask_which_words"
+            return qset["low_score"]["ask_specific_words"], "ask_specific_words"
 
         elif evaluation["mentions_visuals"]:
             if evaluation["has_criticism_word"]:
-                return "What specifically in the visuals or design made it feel that way?", "ask_which_visuals"
-            return "What specifically about the visuals or design didn’t work for you?", "ask_specific_visuals"
+                return qset["low_score"]["ask_which_visuals"], "ask_which_visuals"
+            return qset["low_score"]["ask_specific_visuals"], "ask_specific_visuals"
 
         elif evaluation["mentions_meaning"]:
-            return "What about the message or meaning didn’t feel right to you?", "ask_meaning"
+            return qset["low_score"]["ask_meaning"], "ask_meaning"
 
         else:
-            return "What specifically about it didn’t work for you?", "ask_specifics"
+            return qset["low_score"]["ask_specifics"], "ask_specifics"
 
-    # MID SCORE
     elif route_label == "mid_score":
         if evaluation["mentions_language"]:
-            if evaluation["has_criticism_word"]:
-                return "Which parts of the wording worked for you, and which didn’t?", "explore_both_sides"
-            return "What about the wording worked for you, and what didn’t?", "explore_both_sides"
-
+            return qset["mid_score"]["explore_both_sides_words"], "explore_both_sides"
         elif evaluation["mentions_visuals"]:
-            return "What about the visuals or design worked for you, and what didn’t?", "explore_both_sides"
-
+            return qset["mid_score"]["explore_both_sides_visuals"], "explore_both_sides"
         else:
-            return "What worked for you, and what didn’t?", "explore_both_sides"
+            return qset["mid_score"]["explore_both_sides"], "explore_both_sides"
 
-    # HIGH SCORE
     elif route_label == "high_score":
         if evaluation["mentions_language"]:
             if evaluation["quoted_phrase"]:
-                return "What is it about that wording or phrase that resonated with you?", "ask_why_that_wording"
-            return "What specifically about the wording or tone resonated with you?", "ask_specific_words"
+                return qset["high_score"]["ask_why_that_wording"], "ask_why_that_wording"
+            return qset["high_score"]["ask_specific_words"], "ask_specific_words"
 
         elif evaluation["mentions_visuals"]:
-            return "What specifically about the visuals or design resonated with you?", "ask_specific_visuals"
+            return qset["high_score"]["ask_specific_visuals"], "ask_specific_visuals"
 
         elif evaluation["mentions_meaning"]:
-            return "What about the message or meaning connected with you?", "ask_meaning"
+            return qset["high_score"]["ask_meaning"], "ask_meaning"
 
         else:
-            return "What specifically made it resonate with you?", "ask_specifics"
+            return qset["high_score"]["ask_specifics"], "ask_specifics"
 
-    # NEUTRAL / FALLBACK
     else:
         if evaluation["mentions_language"]:
             if evaluation["has_criticism_word"]:
-                return "Which words or phrases made you feel that way?", "ask_which_words"
-            return "What specifically about the wording or tone stood out to you?", "ask_specific_words"
+                return qset["neutral"]["ask_which_words"], "ask_which_words"
+            return qset["neutral"]["ask_specific_words"], "ask_specific_words"
 
         elif evaluation["mentions_visuals"]:
-            return "What specifically about the visuals or design stood out to you?", "ask_specific_visuals"
+            return qset["neutral"]["ask_specific_visuals"], "ask_specific_visuals"
 
         elif evaluation["mentions_meaning"]:
-            return "What about the message or meaning stood out to you?", "ask_meaning"
+            return qset["neutral"]["ask_meaning"], "ask_meaning"
 
         else:
-            return "What specifically do you mean by that?", "clarify"
+            return qset["neutral"]["clarify"], "clarify"
 
 
 @app.post("/deepdive")
@@ -891,7 +1165,7 @@ async def deepdive(req: DeepDiveRequest):
 
         session["history"].append({"role": "user", "text": req.response})
 
-        if is_invalid_response(req.response):
+        if is_invalid_response(req.response, locale=req.locale):
             session["repair_count"] += 1
 
             if session["repair_count"] >= 3:
@@ -914,7 +1188,7 @@ async def deepdive(req: DeepDiveRequest):
             )
 
             question_code = session.get("current_question_code") or f"{req.question_id}_1"
-            repair_question = generate_repair_question(previous_question, req.response)
+            repair_question = generate_repair_question(previous_question, req.response, locale=req.locale)
 
             session["history"].append({"role": "assistant", "text": repair_question})
             session["current_question_text"] = previous_question
@@ -936,10 +1210,10 @@ async def deepdive(req: DeepDiveRequest):
 
         session["repair_count"] = 0
 
-        evaluation = evaluate_response_veronica(req.response)
+        evaluation = evaluate_response_veronica(req.response, locale=req.locale)
         question_code = f"{req.question_id}_{session['turn_count'] + 1}"
 
-        next_question, action = choose_next_question(route_label, evaluation)
+        next_question, action = choose_next_question(route_label, evaluation, locale=req.locale)
 
         session["current_question_code"] = question_code
         session["current_question_text"] = next_question
