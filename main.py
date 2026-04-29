@@ -1241,10 +1241,10 @@ def build_tesco_followup_2(
     if is_tesco_low_content_response(first_response, locale=locale):
         return "What is it about that network that makes you feel confident choosing or working with them?"
 
-    if is_weak_followup_1_response(followup_1_response):
-        if improvement:
-            return f"What do they actually do in terms of {improvement} that stands out to you?"
-        return "What do they actually do that stands out to you?"
+   if is_weak_followup_1_response(followup_1_response):
+    if improvement:
+        return f"What do they actually do in terms of {improvement}, and why is that important to you?"
+    return "What do they actually do, and why is that important to you?"
 
     if improvement:
         return f"Why is {improvement} important to you, and what would it enable you to do?"
