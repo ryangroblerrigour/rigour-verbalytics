@@ -1340,12 +1340,10 @@ async def deepdive(req: DeepDiveRequest):
 
         session = SESSIONS[session_key]
 
-        config = load_question_config(req.project_id, req.question_id)
-        route = evaluate_route(config, req.prior_answers or {})
-        route_label = route.get("label", "neutral")
-
         # -------------------------------------------------
         # PROJECT-SPECIFIC CARVE OUT: Tesco Media trust
+        # IMPORTANT: This runs BEFORE config loading.
+        # No Q_TESCO_TRUST.json is required for this project.
         # -------------------------------------------------
         if req.project_id == TESCO_PROJECT_ID:
             session.setdefault("tesco", {
@@ -1443,7 +1441,12 @@ async def deepdive(req: DeepDiveRequest):
 
         # -------------------------------------------------
         # GENERIC DEEPDIVE LOGIC
+        # Config is loaded ONLY for non-Tesco projects.
         # -------------------------------------------------
+
+        config = load_question_config(req.project_id, req.question_id)
+        route = evaluate_route(config, req.prior_answers or {})
+        route_label = route.get("label", "neutral")
 
         session["history"].append({"role": "user", "text": req.response})
 
