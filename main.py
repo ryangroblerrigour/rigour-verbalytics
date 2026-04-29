@@ -960,26 +960,13 @@ async def admin_blocklist_refresh():
 
 
 # =========================================================
-# DEEPDIVE MODULE (FINAL – TESCO FIXED)
+# DEEPDIVE MODULE
 # =========================================================
-
-import os
-import json
-import asyncio
-from typing import Optional, Dict
-from fastapi import HTTPException
-from pydantic import BaseModel
-
-# assumed existing
-# from your_app import client, score_engine, LANG_RULES, _clean_text, _normalize_for_matching, _language_bucket
 
 SESSIONS = {}
+
 TESCO_PROJECT_ID = "p338836335523"
 
-
-# =========================================================
-# REQUEST MODEL
-# =========================================================
 
 class DeepDiveRequest(BaseModel):
     project_id: str
@@ -990,17 +977,19 @@ class DeepDiveRequest(BaseModel):
     locale: Optional[str] = None
 
 
-# =========================================================
-# HELPERS
-# =========================================================
-
 def get_session_key(project_id, respondent_id, question_id):
     return f"{project_id}_{respondent_id}_{question_id}"
 
 
 def load_question_config(project_id, question_id):
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(base_dir, "configs", "projects", project_id, f"{question_id}.json")
+    path = os.path.join(
+        base_dir,
+        "configs",
+        "projects",
+        project_id,
+        f"{question_id}.json"
+    )
 
     if not os.path.exists(path):
         raise FileNotFoundError(f"Config not found at {path}")
@@ -1008,10 +997,6 @@ def load_question_config(project_id, question_id):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-
-# =========================================================
-# ROUTING (GENERIC)
-# =========================================================
 
 def evaluate_route(config, prior_answers):
     context = config.get("context", {})
@@ -1027,14 +1012,22 @@ def evaluate_route(config, prior_answers):
     if score_val is not None:
         for route in routes:
             rng = route.get("range")
-            if rng and len(rng) == 2 and rng[0] <= score_val <= rng[1]:
-                return {"label": route.get("label", fallback_route)}
+            if not rng or len(rng) != 2:
+                continue
+            if rng[0] <= score_val <= rng[1]:
+                return {
+                    "label": route.get("label", fallback_route),
+                    "focus": route.get("focus", "")
+                }
 
-    return {"label": fallback_route}
+    return {
+        "label": fallback_route,
+        "focus": "Explore the respondent's answer in depth and clarify what they mean."
+    }
 
 
 # =========================================================
-# TESCO LOGIC
+# TESCO PROJECT-SPECIFIC LOGIC
 # =========================================================
 
 def is_tesco_low_content_response(response: str, locale: Optional[str] = None) -> bool:
@@ -1042,7 +1035,8 @@ def is_tesco_low_content_response(response: str, locale: Optional[str] = None) -
     rl = _normalize_for_matching(r)
 
     low_content = {
-        "dont know", "don't know", "i dont know", "i don't know",
+        "dont know", "don't know",
+        "i dont know", "i don't know",
         "idk", "dk",
         "not sure", "unsure",
         "nothing", "none",
@@ -1056,10 +1050,10 @@ def is_tesco_low_content_response(response: str, locale: Optional[str] = None) -
     if not r:
         return True
 
-    if rl in low_content:
+    if r.isdigit():
         return True
 
-    if r.isdigit():
+    if rl in low_content:
         return True
 
     return False
@@ -1071,23 +1065,71 @@ async def extract_tesco_improvement(response: str, locale: Optional[str] = None)
     if is_tesco_low_content_response(r, locale=locale):
         return ""
 
-    prompt = f"""
-Extract the main improvement or suggestion from this response.
+    rl = _normalize_for_matching(r)
 
-Response:
+    # Deterministic shortcuts for common expected themes
+    if "better reporting" in rl:
+        return "better reporting"
+
+    if "clearer reporting" in rl:
+        return "clearer reporting"
+
+    if "more detailed reporting" in rl:
+        return "more detailed reporting"
+
+    if "reporting" in rl:
+        return "better reporting"
+
+    if "transparency" in rl or "transparent" in rl:
+        return "greater transparency"
+
+    if "roi" in rl or "return on investment" in rl:
+        return "clearer proof of ROI"
+
+    if "measurement" in rl or "measure" in rl:
+        return "clearer measurement"
+
+    if "audience data" in rl:
+        return "stronger audience data"
+
+    if "data" in rl:
+        return "stronger data"
+
+    if "insight" in rl or "insights" in rl:
+        return "better insight"
+
+    if "support" in rl or "service" in rl:
+        return "more proactive support"
+
+    if "communication" in rl or "communicate" in rl:
+        return "clearer communication"
+
+    if "case study" in rl or "case studies" in rl or "proof points" in rl:
+        return "stronger proof points"
+
+    prompt = f"""
+Extract the main improvement or suggestion from this respondent answer.
+
+Question context:
+"What would Tesco Media need to do to strengthen your trust in them as your ideal media partner?"
+
+Respondent answer:
 "{r}"
 
-Return ONLY a short noun phrase (max 5 words).
-If multiple ideas exist, return the most important one.
-No full sentences. No explanation.
+Return ONLY a short noun phrase.
+If multiple improvements are mentioned, return the single most important one.
+Do not return a full sentence.
+Do not include Tesco Media.
+Do not add explanation.
 
 Examples:
 better reporting
 greater transparency
 clearer measurement
-stronger data
+stronger audience data
+more proactive support
 
-If unclear, return: unclear
+If there is no clear improvement, return: unclear
 """
 
     try:
@@ -1095,20 +1137,30 @@ If unclear, return: unclear
             client.chat.completions.create,
             model=os.getenv("MODEL_DEEPDIVE", os.getenv("MODEL_FOLLOWUP", "gpt-4o-mini")),
             messages=[
-                {"role": "system", "content": "Extract concise research themes."},
-                {"role": "user", "content": prompt}
+                {
+                    "role": "system",
+                    "content": "You extract concise research themes from survey responses."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
             ],
             temperature=0,
-            max_tokens=15
+            max_tokens=20,
+            timeout=float(os.getenv("OPENAI_TIMEOUT", "12.0"))
         )
 
-        extracted = result.choices[0].message.content.strip().lower()
-        extracted = extracted.strip("\"'., ")
+        extracted = result.choices[0].message.content.strip()
+        extracted = extracted.strip("\"'“”‘’., ")
 
-        if extracted in {"unclear", "", "none", "nothing"}:
+        if not extracted:
             return ""
 
-        if len(extracted.split()) > 5:
+        if extracted.lower() in {"unclear", "none", "nothing", "n/a", "na"}:
+            return ""
+
+        if len(extracted.split()) > 6:
             return ""
 
         return extracted
@@ -1117,19 +1169,27 @@ If unclear, return: unclear
         return ""
 
 
-def build_tesco_followup_1(response: str, improvement: str, locale=None) -> str:
-    if is_tesco_low_content_response(response, locale):
+def build_tesco_followup_1(
+    response: str,
+    improvement: str,
+    locale: Optional[str] = None
+) -> str:
+    if is_tesco_low_content_response(response, locale=locale):
         return "Is there another media network that you think does this well, and what do they do?"
 
     if improvement:
-        return f"Can you give an example of another network that delivers {improvement} well?"
+        return f"Is there another network you think already delivers {improvement} well, and what do they provide?"
 
-    return "Can you give an example of another network that delivers this well?"
+    return "Is there another network you think already delivers this well, and what do they provide?"
 
 
-def build_tesco_followup_2(first_response: str, improvement: str, locale=None) -> str:
-    if is_tesco_low_content_response(first_response, locale):
-        return "What is it about that network that makes you confident working with them?"
+def build_tesco_followup_2(
+    first_response: str,
+    improvement: str,
+    locale: Optional[str] = None
+) -> str:
+    if is_tesco_low_content_response(first_response, locale=locale):
+        return "What is it about that network that makes you feel confident choosing or working with them?"
 
     if improvement:
         return f"Why is {improvement} important to you, and what would it enable you to do?"
@@ -1138,91 +1198,327 @@ def build_tesco_followup_2(first_response: str, improvement: str, locale=None) -
 
 
 # =========================================================
-# MAIN ENDPOINT
+# GENERIC RESPONSE EVALUATION
+# =========================================================
+
+def evaluate_response_veronica(response: str, locale: Optional[str] = None):
+    lang = _language_bucket(locale, response=response)
+    eval_rules = LANG_RULES[lang]["deepdive_eval"]
+
+    rl = _normalize_for_matching(response)
+    quoted_phrase = ("'" in response) or ('"' in response) or ("«" in response) or ("»" in response)
+
+    return {
+        "mentions_language": any(x in rl for x in eval_rules["mentions_language"]),
+        "mentions_visuals": any(x in rl for x in eval_rules["mentions_visuals"]),
+        "mentions_meaning": any(x in rl for x in eval_rules["mentions_meaning"]),
+        "mentions_relevance": any(x in rl for x in eval_rules["mentions_relevance"]),
+        "is_vague": len(score_engine._tokens(rl)) < 5,
+        "has_criticism_word": any(x in rl for x in eval_rules["criticism_words"]),
+        "quoted_phrase": quoted_phrase,
+        "lang": lang,
+    }
+
+
+def is_invalid_response(response: str, locale: Optional[str] = None) -> bool:
+    r = _clean_text(response)
+    rl = _normalize_for_matching(r)
+    lang = _language_bucket(locale, response=r)
+    rules = LANG_RULES[lang]
+
+    if not r:
+        return True
+
+    if r.isdigit():
+        return True
+
+    if rl in rules["invalid_short"]:
+        return True
+
+    if len(score_engine._tokens(r)) <= 1:
+        return True
+
+    return False
+
+
+def generate_repair_question(previous_question: str, bad_response: str, locale: Optional[str] = None) -> str:
+    lang = _language_bucket(locale, previous_question, bad_response)
+    rules = LANG_RULES[lang]
+
+    r = _clean_text(bad_response)
+
+    if r.isdigit():
+        return rules["repair_numeric"].format(value=r, question=previous_question)
+
+    return rules["repair_general"].format(question=previous_question)
+
+
+def choose_next_question(route_label: str, evaluation: dict, locale: Optional[str] = None):
+    lang = evaluation.get("lang") or _language_bucket(locale)
+    qset = LANG_RULES[lang]["deepdive_questions"]
+
+    if route_label == "low_score":
+        if evaluation["mentions_language"]:
+            if evaluation["quoted_phrase"]:
+                return qset["low_score"]["ask_why_that_wording"], "ask_why_that_wording"
+            if evaluation["has_criticism_word"]:
+                return qset["low_score"]["ask_which_words"], "ask_which_words"
+            return qset["low_score"]["ask_specific_words"], "ask_specific_words"
+
+        elif evaluation["mentions_visuals"]:
+            if evaluation["has_criticism_word"]:
+                return qset["low_score"]["ask_which_visuals"], "ask_which_visuals"
+            return qset["low_score"]["ask_specific_visuals"], "ask_specific_visuals"
+
+        elif evaluation["mentions_meaning"]:
+            return qset["low_score"]["ask_meaning"], "ask_meaning"
+
+        else:
+            return qset["low_score"]["ask_specifics"], "ask_specifics"
+
+    elif route_label == "mid_score":
+        if evaluation["mentions_language"]:
+            return qset["mid_score"]["explore_both_sides_words"], "explore_both_sides"
+        elif evaluation["mentions_visuals"]:
+            return qset["mid_score"]["explore_both_sides_visuals"], "explore_both_sides"
+        else:
+            return qset["mid_score"]["explore_both_sides"], "explore_both_sides"
+
+    elif route_label == "high_score":
+        if evaluation["mentions_language"]:
+            if evaluation["quoted_phrase"]:
+                return qset["high_score"]["ask_why_that_wording"], "ask_why_that_wording"
+            return qset["high_score"]["ask_specific_words"], "ask_specific_words"
+
+        elif evaluation["mentions_visuals"]:
+            return qset["high_score"]["ask_specific_visuals"], "ask_specific_visuals"
+
+        elif evaluation["mentions_meaning"]:
+            return qset["high_score"]["ask_meaning"], "ask_meaning"
+
+        else:
+            return qset["high_score"]["ask_specifics"], "ask_specifics"
+
+    else:
+        if evaluation["mentions_language"]:
+            if evaluation["has_criticism_word"]:
+                return qset["neutral"]["ask_which_words"], "ask_which_words"
+            return qset["neutral"]["ask_specific_words"], "ask_specific_words"
+
+        elif evaluation["mentions_visuals"]:
+            return qset["neutral"]["ask_specific_visuals"], "ask_specific_visuals"
+
+        elif evaluation["mentions_meaning"]:
+            return qset["neutral"]["ask_meaning"], "ask_meaning"
+
+        else:
+            return qset["neutral"]["clarify"], "clarify"
+
+
+# =========================================================
+# ENDPOINT
 # =========================================================
 
 @app.post("/deepdive")
 async def deepdive(req: DeepDiveRequest):
     try:
-        session_key = get_session_key(req.project_id, req.respondent_id, req.question_id)
+        session_key = get_session_key(
+            req.project_id,
+            req.respondent_id,
+            req.question_id
+        )
 
         if session_key not in SESSIONS:
-            SESSIONS[session_key] = {"turn_count": 0, "history": []}
+            SESSIONS[session_key] = {
+                "history": [],
+                "turn_count": 0,
+                "repair_count": 0,
+                "current_question_code": None,
+                "current_question_text": None,
+                "last_valid_question_text": None
+            }
 
         session = SESSIONS[session_key]
 
-        # =================================================
-        # TESCO FLOW
-        # =================================================
+        config = load_question_config(req.project_id, req.question_id)
+        route = evaluate_route(config, req.prior_answers or {})
+        route_label = route.get("label", "neutral")
 
+        # -------------------------------------------------
+        # PROJECT-SPECIFIC CARVE OUT: Tesco Media trust
+        # -------------------------------------------------
         if req.project_id == TESCO_PROJECT_ID:
-            session.setdefault("tesco", {})
+            session.setdefault("tesco", {
+                "first_response": None,
+                "improvement": None,
+                "followup_1_response": None
+            })
 
-            turn = session["turn_count"]
+            tesco_state = session["tesco"]
+            turn_count = session["turn_count"]
+
             session["history"].append({"role": "user", "text": req.response})
 
-            # TURN 0
-            if turn == 0:
-                improvement = await extract_tesco_improvement(req.response, req.locale)
+            # Turn 0: respondent answered the base question
+            if turn_count == 0:
+                improvement = await extract_tesco_improvement(req.response, locale=req.locale)
 
-                session["tesco"] = {
-                    "first_response": req.response,
-                    "improvement": improvement
-                }
+                tesco_state["first_response"] = req.response
+                tesco_state["improvement"] = improvement
 
-                q = build_tesco_followup_1(req.response, improvement, req.locale)
+                next_question = build_tesco_followup_1(
+                    response=req.response,
+                    improvement=improvement,
+                    locale=req.locale
+                )
 
-                session["history"].append({"role": "assistant", "text": q})
+                question_code = f"{req.question_id}_followup_1"
+
+                session["current_question_code"] = question_code
+                session["current_question_text"] = next_question
+                session["last_valid_question_text"] = next_question
+                session["history"].append({"role": "assistant", "text": next_question})
                 session["turn_count"] += 1
 
                 return {
-                    "route": "tesco",
+                    "route": "tesco_media_trust",
+                    "decision": {
+                        "action": "ask_comparator_delivery_example",
+                        "reason": "project_specific_carve_out"
+                    },
                     "deepdive": {
-                        "next_question": q,
-                        "should_continue": True
+                        "question_code": question_code,
+                        "next_question": next_question,
+                        "action": "ask_comparator_delivery_example",
+                        "should_continue": True,
+                        "is_loop": False
                     }
                 }
 
-            # TURN 1
-            if turn == 1:
-                improvement = session["tesco"].get("improvement", "")
-                first_response = session["tesco"].get("first_response", "")
+            # Turn 1: respondent answered follow-up-1
+            if turn_count == 1:
+                tesco_state["followup_1_response"] = req.response
 
-                q = build_tesco_followup_2(first_response, improvement, req.locale)
+                next_question = build_tesco_followup_2(
+                    first_response=tesco_state.get("first_response") or "",
+                    improvement=tesco_state.get("improvement") or "",
+                    locale=req.locale
+                )
 
-                session["history"].append({"role": "assistant", "text": q})
+                question_code = f"{req.question_id}_followup_2"
+
+                session["current_question_code"] = question_code
+                session["current_question_text"] = next_question
+                session["last_valid_question_text"] = next_question
+                session["history"].append({"role": "assistant", "text": next_question})
                 session["turn_count"] += 1
 
                 return {
-                    "route": "tesco",
+                    "route": "tesco_media_trust",
+                    "decision": {
+                        "action": "ask_importance_and_enablement",
+                        "reason": "project_specific_carve_out"
+                    },
                     "deepdive": {
-                        "next_question": q,
-                        "should_continue": True
+                        "question_code": question_code,
+                        "next_question": next_question,
+                        "action": "ask_importance_and_enablement",
+                        "should_continue": True,
+                        "is_loop": False
                     }
                 }
 
-            # TURN 2 → STOP
+            # Turn 2: respondent answered follow-up-2, so stop
             return {
-                "route": "tesco",
+                "route": "tesco_media_trust",
+                "decision": {
+                    "action": "stop",
+                    "reason": "project_specific_session_complete"
+                },
                 "deepdive": {
-                    "should_continue": False
+                    "should_continue": False,
+                    "stop_reason": "project_specific_session_complete"
                 }
             }
 
-        # =================================================
-        # GENERIC FLOW (unchanged)
-        # =================================================
+        # -------------------------------------------------
+        # GENERIC DEEPDIVE LOGIC
+        # -------------------------------------------------
 
-        config = load_question_config(req.project_id, req.question_id)
-        route = evaluate_route(config, req.prior_answers or {})
+        session["history"].append({"role": "user", "text": req.response})
+
+        if is_invalid_response(req.response, locale=req.locale):
+            session["repair_count"] += 1
+
+            if session["repair_count"] >= 3:
+                return {
+                    "route": route_label,
+                    "decision": {
+                        "action": "stop",
+                        "reason": "repair_exhausted"
+                    },
+                    "deepdive": {
+                        "should_continue": False,
+                        "stop_reason": "repair_exhausted"
+                    }
+                }
+
+            previous_question = (
+                session.get("current_question_text")
+                or session.get("last_valid_question_text")
+                or config.get("question_context", {}).get("main_question", "Please answer in words.")
+            )
+
+            question_code = session.get("current_question_code") or f"{req.question_id}_1"
+            repair_question = generate_repair_question(previous_question, req.response, locale=req.locale)
+
+            session["history"].append({"role": "assistant", "text": repair_question})
+            session["current_question_text"] = previous_question
+
+            return {
+                "route": route_label,
+                "decision": {
+                    "action": "repair",
+                    "reason": "invalid_response_same_turn"
+                },
+                "deepdive": {
+                    "question_code": question_code,
+                    "next_question": repair_question,
+                    "action": "repair",
+                    "should_continue": True,
+                    "is_loop": True
+                }
+            }
+
+        session["repair_count"] = 0
+
+        evaluation = evaluate_response_veronica(req.response, locale=req.locale)
+        question_code = f"{req.question_id}_{session['turn_count'] + 1}"
+
+        next_question, action = choose_next_question(route_label, evaluation, locale=req.locale)
+
+        session["current_question_code"] = question_code
+        session["current_question_text"] = next_question
+        session["last_valid_question_text"] = next_question
+        session["history"].append({"role": "assistant", "text": next_question})
+        session["turn_count"] += 1
 
         return {
-            "route": route.get("label", "neutral"),
+            "route": route_label,
+            "decision": {
+                "action": action,
+                "reason": "route_and_response_selected"
+            },
             "deepdive": {
-                "next_question": "Generic DeepDive flow here",
-                "should_continue": True
+                "question_code": question_code,
+                "next_question": next_question,
+                "action": action,
+                "should_continue": True,
+                "is_loop": False
             }
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
