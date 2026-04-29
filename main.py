@@ -1080,6 +1080,15 @@ async def extract_tesco_improvement(response: str, locale: Optional[str] = None)
     if "reporting" in rl:
         return "better reporting"
 
+    if "consultative" in rl:
+        return "a more consultative approach"
+
+    if "consultation" in rl or "consulting" in rl:
+        return "a more consultative approach"
+
+    if "advice" in rl or "advisory" in rl:
+        return "stronger advisory support"
+
     if "transparency" in rl or "transparent" in rl:
         return "greater transparency"
 
@@ -1128,6 +1137,7 @@ greater transparency
 clearer measurement
 stronger audience data
 more proactive support
+a more consultative approach
 
 If there is no clear improvement, return: unclear
 """
@@ -1169,6 +1179,45 @@ If there is no clear improvement, return: unclear
         return ""
 
 
+def is_weak_followup_1_response(response: str) -> bool:
+    r = _clean_text(response)
+    rl = _normalize_for_matching(r)
+
+    weak_patterns = [
+        "everything",
+        "everything tesco does",
+        "and more",
+        "more",
+        "better",
+        "just better",
+        "same but better",
+        "they do more",
+        "they do everything",
+        "does more",
+        "provides more",
+        "provide more",
+        "good",
+        "great",
+        "not sure",
+        "unsure",
+        "i dont know",
+        "i don't know",
+        "dont know",
+        "don't know"
+    ]
+
+    if not r:
+        return True
+
+    if len(score_engine._tokens(r)) <= 4:
+        return True
+
+    if any(p in rl for p in weak_patterns):
+        return True
+
+    return False
+
+
 def build_tesco_followup_1(
     response: str,
     improvement: str,
@@ -1185,11 +1234,17 @@ def build_tesco_followup_1(
 
 def build_tesco_followup_2(
     first_response: str,
+    followup_1_response: str,
     improvement: str,
     locale: Optional[str] = None
 ) -> str:
     if is_tesco_low_content_response(first_response, locale=locale):
         return "What is it about that network that makes you feel confident choosing or working with them?"
+
+    if is_weak_followup_1_response(followup_1_response):
+        if improvement:
+            return f"What do they actually do in terms of {improvement} that stands out to you?"
+        return "What do they actually do that stands out to you?"
 
     if improvement:
         return f"Why is {improvement} important to you, and what would it enable you to do?"
@@ -1399,6 +1454,7 @@ async def deepdive(req: DeepDiveRequest):
 
                 next_question = build_tesco_followup_2(
                     first_response=tesco_state.get("first_response") or "",
+                    followup_1_response=req.response,
                     improvement=tesco_state.get("improvement") or "",
                     locale=req.locale
                 )
@@ -1414,13 +1470,13 @@ async def deepdive(req: DeepDiveRequest):
                 return {
                     "route": "tesco_media_trust",
                     "decision": {
-                        "action": "ask_importance_and_enablement",
+                        "action": "ask_importance_or_specifics",
                         "reason": "project_specific_carve_out"
                     },
                     "deepdive": {
                         "question_code": question_code,
                         "next_question": next_question,
-                        "action": "ask_importance_and_enablement",
+                        "action": "ask_importance_or_specifics",
                         "should_continue": True,
                         "is_loop": False
                     }
