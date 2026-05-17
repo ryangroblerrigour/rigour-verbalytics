@@ -39,6 +39,7 @@ from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from postcode_service import lookup_postcode
 
 try:
     from openai import OpenAI
