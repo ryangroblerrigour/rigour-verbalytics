@@ -5,3 +5,4 @@ uvicorn[standard]>=0.30
 requests>=2.31
 openai>=1.44
 python-dotenv>=1.0
+httpx
