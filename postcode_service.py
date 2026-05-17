@@ -45,18 +45,18 @@ async def lookup_postcode(postcode: str):
 
     result = data.get("result", {})
     
-    implausible_reason = IMPLAUSIBLE_POSTCODES.get(
-    result.get("postcode") or postcode
-)
+        implausible_reason = IMPLAUSIBLE_POSTCODES.get(
+        result.get("postcode") or postcode
+    )
 
-return {
-    "is_valid": True,
-    "is_partial": is_partial,
-    "postcode": postcode,
-    "country": result.get("country"),
-    "region": result.get("region") or result.get("country"),
-    "admin_district": result.get("admin_district"),
-    "urban_rural": result.get("rural_urban") or result.get("codes", {}).get("rural_urban"),
-    "implausible": bool(implausible_reason),
-    "implausible_reason": implausible_reason,
-}
+    return {
+        "is_valid": True,
+        "is_partial": is_partial,
+        "postcode": postcode,
+        "country": result.get("country"),
+        "region": result.get("region") or result.get("country"),
+        "admin_district": result.get("admin_district"),
+        "urban_rural": result.get("rural_urban") or result.get("codes", {}).get("rural_urban"),
+        "implausible": bool(implausible_reason),
+        "implausible_reason": implausible_reason,
+    }
