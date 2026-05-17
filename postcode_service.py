@@ -43,10 +43,11 @@ async def lookup_postcode(postcode: str):
     result = data.get("result", {})
 
     return {
-        "is_valid": True,
-        "is_partial": is_partial,
-        "postcode": postcode,
-        "country": result.get("country"),
-        "region": result.get("region") or result.get("country"),
-        "admin_district": result.get("admin_district")
-    }
+    "is_valid": True,
+    "is_partial": is_partial,
+    "postcode": postcode,
+    "country": result.get("country"),
+    "region": result.get("region") or result.get("country"),
+    "admin_district": result.get("admin_district"),
+    "urban_rural": result.get("rural_urban")
+}
