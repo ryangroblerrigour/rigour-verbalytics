@@ -47,6 +47,6 @@ async def lookup_postcode(postcode: str):
         "is_partial": is_partial,
         "postcode": postcode,
         "country": result.get("country"),
-        "region": result.get("region"),
+        "region": result.get("region") or result.get("country"),
         "admin_district": result.get("admin_district")
     }
