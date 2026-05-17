@@ -803,7 +803,11 @@ def health() -> dict:
         "blocklist_projects": project_count,
     }
 
-
+@app.post("/validate-postcode")
+async def validate_postcode(payload: dict):
+    postcode = payload.get("postcode", "")
+    return await lookup_postcode(postcode)
+  
 @app.post("/verbalytics", response_model=VerbalyticsOutput)
 async def verbalytics(payload: VerbalyticsInput = Body(...)):
     start = time.time()
