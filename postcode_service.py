@@ -10,7 +10,10 @@ OUTCODE_REGEX = re.compile(
     r"^[A-Z]{1,2}[0-9][0-9A-Z]?$"
 )
 
-
+IMPLAUSIBLE_POSTCODES = {
+    "SW1A 1AA": "Buckingham Palace",
+    "SW1A 2AA": "10 Downing Street",
+}
 async def lookup_postcode(postcode: str):
     postcode = postcode.strip().upper()
 
@@ -41,8 +44,12 @@ async def lookup_postcode(postcode: str):
         }
 
     result = data.get("result", {})
+    
+    implausible_reason = IMPLAUSIBLE_POSTCODES.get(
+    result.get("postcode") or postcode
+)
 
-    return {
+return {
     "is_valid": True,
     "is_partial": is_partial,
     "postcode": postcode,
@@ -50,4 +57,6 @@ async def lookup_postcode(postcode: str):
     "region": result.get("region") or result.get("country"),
     "admin_district": result.get("admin_district"),
     "urban_rural": result.get("rural_urban") or result.get("codes", {}).get("rural_urban"),
+    "implausible": bool(implausible_reason),
+    "implausible_reason": implausible_reason,
 }
