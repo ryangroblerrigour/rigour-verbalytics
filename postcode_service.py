@@ -14,7 +14,10 @@ IMPLAUSIBLE_POSTCODES = {
     "SW1A 1AA": "Buckingham Palace",
     "SW1A 2AA": "10 Downing Street",
 }
+
+
 async def lookup_postcode(postcode: str):
+
     postcode = postcode.strip().upper()
 
     is_full = bool(POSTCODE_REGEX.match(postcode))
@@ -28,7 +31,6 @@ async def lookup_postcode(postcode: str):
 
     if is_full:
         url = f"https://api.postcodes.io/postcodes/{postcode}"
-
     else:
         url = f"https://api.postcodes.io/outcodes/{postcode}"
 
@@ -44,8 +46,8 @@ async def lookup_postcode(postcode: str):
         }
 
     result = data.get("result", {})
-    
-        implausible_reason = IMPLAUSIBLE_POSTCODES.get(
+
+    implausible_reason = IMPLAUSIBLE_POSTCODES.get(
         result.get("postcode") or postcode
     )
 
