@@ -970,7 +970,10 @@ async def admin_blocklist_refresh():
 
 SESSIONS = {}
 
-TESCO_PROJECT_ID = "p338836335523"
+TESCO_PROJECT_IDS = {
+    "p338836335523",
+    "p788014194290"
+}
 
 
 class DeepDiveRequest(BaseModel):
@@ -1405,7 +1408,7 @@ async def deepdive(req: DeepDiveRequest):
         # IMPORTANT: This runs BEFORE config loading.
         # No Q_TESCO_TRUST.json is required for this project.
         # -------------------------------------------------
-        if req.project_id == TESCO_PROJECT_ID:
+        if req.project_id == TESCO_PROJECT_IDS:
             session.setdefault("tesco", {
                 "first_response": None,
                 "improvement": None,
