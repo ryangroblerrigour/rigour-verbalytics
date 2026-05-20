@@ -1408,7 +1408,7 @@ async def deepdive(req: DeepDiveRequest):
         # IMPORTANT: This runs BEFORE config loading.
         # No Q_TESCO_TRUST.json is required for this project.
         # -------------------------------------------------
-        if req.project_id == TESCO_PROJECT_IDS:
+        if req.project_id in TESCO_PROJECT_IDS:
             session.setdefault("tesco", {
                 "first_response": None,
                 "improvement": None,
