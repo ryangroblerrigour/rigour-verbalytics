@@ -1766,3 +1766,5 @@ async def deepdive(req: DeepDiveRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# NOTE: Update generate_followup() with the new B8/B9 vague-response prompts as discussed.
