@@ -777,6 +777,56 @@ SYSTEM_FOLLOWUP = (
 
 
 # ---------------------------------------------------------------------
+# Project-specific follow-up objectives
+# ---------------------------------------------------------------------
+PROJECT_SPECIFIC_FOLLOWUP_OBJECTIVES = {
+    "p593951831588": {
+        "B8": (
+            "This is the first follow-up after the base question: "
+            "Now we’d like to put you in the creative director’s seat. "
+            "Imagine you were responsible for this advert. "
+            "What’s working well in this advert? "
+            "Probe for specific elements they liked: visuals, story, music, message, "
+            "vehicle shown, emotional reactions, and the reasons why those elements are liked."
+        ),
+        "B9": (
+            "This is the first follow-up after the base question: "
+            "You’re still in the creative director’s seat. "
+            "What would you change or improve to make this advert or these adverts more effective? "
+            "Probe for specific elements they disliked or would improve: visuals, story, music, "
+            "message, vehicle shown, emotional reactions, and the reasons why those elements are disliked."
+        ),
+    }
+}
+
+
+def get_project_followup_objective(
+    project_id: Optional[str],
+    context: Optional[dict]
+) -> Optional[str]:
+    """
+    Returns a project/question-specific follow-up objective when supplied.
+
+    Expected request context examples:
+      {"question_id": "B8"}
+      {"question_code": "B8"}
+      {"qid": "B8"}
+    """
+    if not project_id or not context:
+        return None
+
+    question_id = (
+        context.get("question_id")
+        or context.get("question_code")
+        or context.get("qid")
+        or ""
+    )
+    question_id = str(question_id).strip().upper()
+
+    return PROJECT_SPECIFIC_FOLLOWUP_OBJECTIVES.get(project_id, {}).get(question_id)
+
+
+# ---------------------------------------------------------------------
 # Generators (OpenAI)
 # ---------------------------------------------------------------------
 async def _call_openai_chat(messages: list[dict], model: str, max_tokens: int) -> str:
@@ -846,9 +896,27 @@ async def generate_followup(
     model: str = DEFAULT_MODEL_FOLLOWUP,
     context: Optional[dict] = None
 ) -> str:
+    project_objective = get_project_followup_objective(project_id, context)
+
+    system_prompt = SYSTEM_FOLLOWUP + " " + _locale_instruction(locale)
+    if project_objective:
+        system_prompt += (
+            " Project-specific objective: "
+            + project_objective
+            + " Use the respondent's own wording as the starting point. "
+            + "Ask only one natural open-ended question. "
+            + "Do not list every possible element unless the respondent is very vague. "
+            + "Do not mention that this is a project-specific objective."
+        )
+
+    user_prompt = (
+        f"Original question: {question.strip()} "
+        f"Respondent's answer: {response.strip()}"
+    )
+
     messages = [
-        {"role": "system", "content": SYSTEM_FOLLOWUP + " " + _locale_instruction(locale)},
-        {"role": "user", "content": f"Original question: {question.strip()} Respondent's answer: {response.strip()}"},
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
     ]
     text = await _call_openai_chat(messages, model=model, max_tokens=min(48, MAX_TOKENS))
     t = (text or "").strip().replace("\n", " ")
@@ -861,9 +929,10 @@ async def generate_followup(
 
     if contains_blocked_phrase(t, project_id):
         avoid = ", ".join(sorted(list(get_block_phrases(project_id))))
+        retry_system_prompt = system_prompt + (f" Avoid these terms: {avoid}" if avoid else "")
         messages2 = [
-            {"role": "system", "content": SYSTEM_FOLLOWUP + " " + _locale_instruction(locale) + (f" Avoid these terms: {avoid}" if avoid else "")},
-            {"role": "user", "content": f"Original question: {question.strip()} Respondent's answer: {response.strip()}"},
+            {"role": "system", "content": retry_system_prompt},
+            {"role": "user", "content": user_prompt},
         ]
         text2 = await _call_openai_chat(messages2, model=model, max_tokens=min(48, MAX_TOKENS))
         t2 = (text2 or "").strip().replace("\n", " ")
