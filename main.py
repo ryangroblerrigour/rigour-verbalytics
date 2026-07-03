@@ -827,6 +827,105 @@ def get_project_followup_objective(
 
 
 # ---------------------------------------------------------------------
+# Deterministic project-specific follow-up overrides
+# ---------------------------------------------------------------------
+P593951831588_PROJECT_ID = "p593951831588"
+
+P593951831588_B8_VAGUE_FOLLOWUP = (
+    "Can you tell me a little more about that? Was it the way the advert looked or sounded, "
+    "the story it told, the message it communicated, or the vehicle itself that stood out to you? "
+    "What was it about those elements that you particularly liked, and why?"
+)
+
+P593951831588_B9_VAGUE_FOLLOWUP = (
+    "Can you tell me a little more about that? Was there something about the way the advert looked or sounded, "
+    "the story it told, the message it communicated, or the vehicle itself that you'd improve? "
+    "What was it about those elements that didn't work for you, and why?"
+)
+
+AD_SPECIFIC_ELEMENTS = {
+    "visual", "visuals", "look", "looked", "looks", "looking", "colour", "color", "image", "images",
+    "scene", "scenes", "shot", "shots", "camera", "lighting", "design", "style", "setting",
+    "music", "song", "sound", "sounded", "sounds", "audio", "voice", "voiceover", "jingle",
+    "story", "plot", "narrative", "character", "characters", "people", "actor", "actors",
+    "message", "meaning", "theme", "idea", "point", "claim",
+    "vehicle", "car", "van", "truck", "model", "driving", "driver"
+}
+
+AD_VAGUE_TERMS = {
+    "nice", "good", "great", "fine", "ok", "okay", "alright", "enjoyable", "enjoyed",
+    "interesting", "engaging", "memorable", "effective", "appealing", "liked", "like", "love", "loved",
+    "overall", "not bad", "worked well", "works well", "strong", "clear",
+    "bad", "poor", "boring", "confusing", "weak", "annoying", "didn't like", "didnt like",
+    "not great", "not very good", "could be better"
+}
+
+
+def get_project_question_id(context: Optional[dict], question: Optional[str] = None) -> str:
+    if context:
+        question_id = str(
+            context.get("question_id")
+            or context.get("question_code")
+            or context.get("qid")
+            or ""
+        ).strip().upper()
+        if question_id:
+            return question_id
+
+    # Fallback only, in case the survey platform fails to pass context.
+    q = _normalize_for_matching(question)
+    if "what’s working well in this advert" in q or "what's working well in this advert" in q:
+        return "B8"
+    if "what would you change or improve" in q:
+        return "B9"
+    return ""
+
+
+def is_vague_ad_response(response: str) -> bool:
+    """Return True for directionless advert feedback such as 'i liked it' or 'it was nice'."""
+    r = _clean_text(response)
+    rl = _normalize_for_matching(r)
+    tokens = score_engine._tokens(r)
+
+    if not rl:
+        return True
+
+    # If they have already given a concrete creative element, allow the LLM to probe that element specifically.
+    if any(element in rl for element in AD_SPECIFIC_ELEMENTS):
+        return False
+
+    # Very short, directionless answers should always use the deterministic moderator probe.
+    if len(tokens) <= 6:
+        return True
+
+    # Longer but still generic answers should also use the deterministic moderator probe.
+    if any(term in rl for term in AD_VAGUE_TERMS):
+        return True
+
+    return False
+
+
+def get_deterministic_project_followup(
+    project_id: Optional[str],
+    question: Optional[str],
+    context: Optional[dict],
+    response: str
+) -> Optional[str]:
+    if _norm(project_id or "") != P593951831588_PROJECT_ID:
+        return None
+
+    question_id = get_project_question_id(context, question)
+
+    if question_id == "B8" and is_vague_ad_response(response):
+        return P593951831588_B8_VAGUE_FOLLOWUP
+
+    if question_id == "B9" and is_vague_ad_response(response):
+        return P593951831588_B9_VAGUE_FOLLOWUP
+
+    return None
+
+
+# ---------------------------------------------------------------------
 # Generators (OpenAI)
 # ---------------------------------------------------------------------
 async def _call_openai_chat(messages: list[dict], model: str, max_tokens: int) -> str:
@@ -896,6 +995,10 @@ async def generate_followup(
     model: str = DEFAULT_MODEL_FOLLOWUP,
     context: Optional[dict] = None
 ) -> str:
+    deterministic_followup = get_deterministic_project_followup(project_id, question, context, response)
+    if deterministic_followup:
+        return deterministic_followup
+
     project_objective = get_project_followup_objective(project_id, context)
 
     system_prompt = SYSTEM_FOLLOWUP + " " + _locale_instruction(locale)
@@ -972,6 +1075,7 @@ def health() -> dict:
         project_count = len(_block_projects)
     return {
         "ok": True,
+        "build": "p593951831588_ad_probe_v3",
         "model_ack": DEFAULT_MODEL_ACK,
         "model_snapback": DEFAULT_MODEL_SNAPBACK,
         "model_followup": DEFAULT_MODEL_FOLLOWUP,
@@ -1015,7 +1119,9 @@ async def verbalytics(payload: VerbalyticsInput = Body(...)):
             latency_ms=latency_ms,
         )
 
-    snap_task = asyncio.create_task(generate_snapback(payload.question, payload.response, payload.project_id, payload.locale))
+    # Only run snapback when explicitly doing a check-only request.
+    # Do not generate snapback for followup-only calls.
+    snap_task = None
     ack_task = asyncio.create_task(generate_ack(payload.question, payload.response, payload.project_id, payload.locale)) if want_ack else None
     follow_task = asyncio.create_task(generate_followup(
         payload.question, payload.response, payload.project_id, payload.locale, context=payload.context
@@ -1030,7 +1136,8 @@ async def verbalytics(payload: VerbalyticsInput = Body(...)):
 
     ack_res = follow_res = snap_res = None
     try:
-        snap_res = await snap_task
+        if snap_task:
+            snap_res = await snap_task
         if ack_task:
             ack_res = await ack_task
         if follow_task:
@@ -1089,15 +1196,17 @@ async def verbalytics_stream(payload: VerbalyticsInput = Body(...)):
                 "input_blocked_phrases": input_hits or None,
             }).body + b"\n"
 
-        snap_task = asyncio.create_task(generate_snapback(payload.question, payload.response, payload.project_id, payload.locale))
+        # Only run snapback when explicitly needed; do not emit snapback for followup-only calls.
+        snap_task = None
         ack_task = asyncio.create_task(generate_ack(payload.question, payload.response, payload.project_id, payload.locale)) if want_ack else None
         follow_task = asyncio.create_task(generate_followup(
             payload.question, payload.response, payload.project_id, payload.locale, context=payload.context
         )) if want_follow else None
 
-        snap = await snap_task
-        if snap:
-            yield JSONResponse(content={"type": "snapback", "snapback": snap}).body + b"\n"
+        if snap_task:
+            snap = await snap_task
+            if snap:
+                yield JSONResponse(content={"type": "snapback", "snapback": snap}).body + b"\n"
 
         if ack_task:
             ack = await ack_task
@@ -1767,4 +1876,3 @@ async def deepdive(req: DeepDiveRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# NOTE: Update generate_followup() with the new B8/B9 vague-response prompts as discussed.
