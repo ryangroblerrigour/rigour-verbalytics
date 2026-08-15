@@ -800,6 +800,27 @@ PROJECT_SPECIFIC_FOLLOWUP_OBJECTIVES = {
 }
 
 
+# Project-wide follow-up guardrails.
+# These apply to every follow-up question for the named project, regardless of question_id.
+PROJECT_SPECIFIC_FOLLOWUP_GUARDRAILS = {
+    "p711934183731": (
+        "STRICT RESPONDENT-LED PROBING RULES: "
+        "This is a medical research study involving patients and healthcare professionals (HCPs). "
+        "Never refer to participants as consumers or customers. "
+        "The follow-up question must be based ONLY on concepts, experiences, issues, opinions, "
+        "or terminology explicitly raised in the respondent's answer. "
+        "Do NOT introduce, suggest, infer, assume, or name any new topic, concept, barrier, benefit, "
+        "behaviour, motivation, outcome, explanation, or answer category that the respondent has not already raised. "
+        "Do NOT narrow a broad or open response toward a specific dimension unless the respondent explicitly mentioned that dimension. "
+        "Do NOT provide examples, options, prompts, or suggested answers in the follow-up question. "
+        "Probe only by asking the respondent to explain, clarify, expand on, or give the reason for something they have already said. "
+        "If there is no specific respondent-raised concept that can safely be probed, ask a completely neutral question inviting them to elaborate. "
+        "When uncertain whether a concept was raised by the respondent, treat it as NOT raised. "
+        "Depth is allowed; introducing new subject matter is not."
+    )
+}
+
+
 def get_project_followup_objective(
     project_id: Optional[str],
     context: Optional[dict]
@@ -824,6 +845,14 @@ def get_project_followup_objective(
     question_id = str(question_id).strip().upper()
 
     return PROJECT_SPECIFIC_FOLLOWUP_OBJECTIVES.get(project_id, {}).get(question_id)
+
+
+def get_project_followup_guardrails(project_id: Optional[str]) -> Optional[str]:
+    """Return project-wide follow-up guardrails when configured."""
+    if not project_id:
+        return None
+
+    return PROJECT_SPECIFIC_FOLLOWUP_GUARDRAILS.get(project_id)
 
 
 # ---------------------------------------------------------------------
@@ -897,8 +926,13 @@ async def generate_followup(
     context: Optional[dict] = None
 ) -> str:
     project_objective = get_project_followup_objective(project_id, context)
+    project_guardrails = get_project_followup_guardrails(project_id)
 
     system_prompt = SYSTEM_FOLLOWUP + " " + _locale_instruction(locale)
+
+    if project_guardrails:
+        system_prompt += " " + project_guardrails
+
     if project_objective:
         system_prompt += (
             " Project-specific objective: "
