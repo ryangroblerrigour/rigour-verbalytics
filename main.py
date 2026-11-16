@@ -40,6 +40,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from postcode_service import lookup_postcode
+from deprivation_lookup import lookup_deprivation, EMPTY as DEPRIVATION_EMPTY
 
 try:
     from openai import OpenAI
@@ -1017,7 +1018,20 @@ def health() -> dict:
 @app.post("/validate-postcode")
 async def validate_postcode(payload: dict):
     postcode = payload.get("postcode", "")
-    return await lookup_postcode(postcode)
+    result = await lookup_postcode(postcode)
+
+    # RIG926002: add deprivation quintile fields (null if invalid or not found)
+    if isinstance(result, dict):
+        try:
+            if result.get("is_valid"):
+                dep = lookup_deprivation(result.get("postcode") or postcode)
+            else:
+                dep = dict(DEPRIVATION_EMPTY)
+        except Exception:
+            dep = dict(DEPRIVATION_EMPTY)
+        result.update(dep)
+
+    return result
   
 @app.post("/verbalytics", response_model=VerbalyticsOutput)
 async def verbalytics(payload: VerbalyticsInput = Body(...)):
